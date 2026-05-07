@@ -264,7 +264,48 @@ def _is_int(s: str) -> bool:
         return False
 
 
-# Initialize a FSDP2 model from DCP or PyTorch standard checkpoint
+# # Initialize a FSDP2 model from DCP or PyTorch standard checkpoint
+# def init_fsdp_model_from_checkpoint(
+#     model: torch.nn.Module,
+#     checkpoint_path: str,
+#     skip_load_keys: List[str] | None = None,
+#     keys_not_sharded: List[str] | None = None,
+#     process_group: dist.ProcessGroup = None,
+# ):
+#     if not Path(checkpoint_path).is_dir():  # PyTorch standard checkpoint
+#         logger.info(f"Loading pretrained weights from {checkpoint_path}")
+#         chkpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)["teacher"]
+#         from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+
+#         if process_group is None:
+#             world_mesh = init_device_mesh(
+#                 "cuda",
+#                 mesh_shape=(dist.get_world_size(),),
+#                 mesh_dim_names=("dp",),
+#             )
+#         else:
+#             world_mesh = DeviceMesh.from_group(process_group, "cuda")
+#         if dist.get_world_size() > 1:
+#             chkpt = {
+#                 key: (
+#                     torch.distributed.tensor.distribute_tensor(tensor, world_mesh, src_data_rank=None)
+#                     if not any(key_not_sharded in key for key_not_sharded in keys_not_sharded)
+#                     else tensor
+#                 )
+#                 for key, tensor in chkpt.items()
+#             }
+#         model.load_state_dict(
+#             {
+#                 key: tensor
+#                 for key, tensor in chkpt.items()
+#                 if not any(skip_load_key in key for skip_load_key in skip_load_keys)
+#             }
+#         )
+#     else:  # DCP checkpoint
+#         load_checkpoint(ckpt_dir=checkpoint_path, model=model, process_group=process_group)
+
+
+# Original function code doesnt support for single GPU 
 def init_fsdp_model_from_checkpoint(
     model: torch.nn.Module,
     checkpoint_path: str,
@@ -274,41 +315,40 @@ def init_fsdp_model_from_checkpoint(
 ):
     if not Path(checkpoint_path).is_dir():  # PyTorch standard checkpoint
         logger.info(f"Loading pretrained weights from {checkpoint_path}")
-        chkpt = torch.load(checkpoint_path, map_location="cpu")["teacher"]
-        from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+        raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        chkpt = raw["teacher"] if "teacher" in raw else raw
 
-        if process_group is None:
-            world_mesh = init_device_mesh(
-                "cuda",
-                mesh_shape=(dist.get_world_size(),),
-                mesh_dim_names=("dp",),
-            )
-        else:
-            world_mesh = DeviceMesh.from_group(process_group, "cuda")
-        chkpt = {
-            key: (
-                torch.distributed.tensor.distribute_tensor(tensor, world_mesh, src_data_rank=None)
-                if not any(key_not_sharded in key for key_not_sharded in keys_not_sharded)
-                else tensor
-            )
-            for key, tensor in chkpt.items()
-        }
-        model.load_state_dict(
-            {
-                key: tensor
-                for key, tensor in chkpt.items()
-                if not any(skip_load_key in key for skip_load_key in skip_load_keys)
-            }
-        )
+        if skip_load_keys is None:
+            skip_load_keys = []
+
+        from torch.distributed._tensor import DTensor
+
+        # Must load both parameters AND buffers (e.g. rope_embed.periods)
+        all_tensors = list(model.named_parameters()) + list(model.named_buffers())
+        loaded = 0
+        with torch.no_grad():
+            for name, param in all_tensors:
+                if any(s in name for s in skip_load_keys):
+                    continue
+                if name not in chkpt:
+                    logger.warning(f"Key not in checkpoint: {name}")
+                    continue
+                src = chkpt[name].cuda()
+                if isinstance(param, DTensor):
+                    param._local_tensor.copy_(src)
+                else:
+                    param.data.copy_(src)
+                loaded += 1
+
+        logger.info(f"Loaded {loaded} tensors (params+buffers) from {checkpoint_path}")
     else:  # DCP checkpoint
         load_checkpoint(ckpt_dir=checkpoint_path, model=model, process_group=process_group)
-
 
 # Initialize a standard non distributed PyTorch model from PyTorch standard checkpoint for evals
 def init_model_from_checkpoint_for_evals(
     model: torch.nn.Module, pretrained_weights: str | Path, checkpoint_key: str = None
 ):
-    state_dict = torch.load(pretrained_weights, map_location="cpu")
+    state_dict = torch.load(pretrained_weights, map_location="cpu", weights_only=False)
     if checkpoint_key is not None and checkpoint_key in state_dict:
         logger.info(f"Take key {checkpoint_key} in provided checkpoint dict")
         state_dict = state_dict[checkpoint_key]
