@@ -1,0 +1,5 @@
+docker run -it --rm \
+  --gpus all \
+  -v /home/beex-dgx/Vision_Tools:/workspace \
+  --shm-size=64gb \
+  dinov3-auv:v1.0
