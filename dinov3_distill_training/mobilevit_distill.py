@@ -6,15 +6,15 @@ MobileViT backbone adapted for dense feature distillation from DINOv3 ViT-Large/
 ARCHITECTURAL CHANGES vs. original MobileViT
 =============================================
 
-Goal: student output must be [B, 28, 28, 1024] to match the teacher's
+Goal: student output must be [B, G, G, 1024] to match the teacher's
       x_norm_patchtokens grid exactly — same spatial resolution, same feature dim.
 
 Teacher target shape derivation
 --------------------------------
-  DINOv3 ViT-L/16, 448×448 input
-  patch size = 16×16  →  grid = 448/16 = 28×28 = 784 tokens
+  DINOv3 ViT-L/16, square input divisible by 16
+  patch size = 16×16  →  grid = image_size/16
   feature dim = 1024
-  target: x_norm_patchtokens  [B, 784, 1024]  →  [B, 28, 28, 1024]  (L2-normalised)
+  target: x_norm_patchtokens  [B, G*G, 1024]  →  [B, G, G, 1024]  (L2-normalised)
 
 Original MobileViT spatial trace (256×256, stride product = 32)
 ----------------------------------------------------------------
@@ -33,7 +33,7 @@ Change 1 — Remove the last stride-2 downsampling (mv2[6])
 ----------------------------------------------------------
   mv2[6] stride changed from 2 → 1.
   New stride product = 16.
-  At 448×448 input: H/16 = 28×28  ✓
+  At 448×448 input: H/16 = 28×28; at 512×512 input: H/16 = 32×32.
 
   Why this is architecturally sound:
   • MV2Block explicitly allows stride ∈ {1, 2} — the assert still passes.
@@ -75,8 +75,8 @@ Summary of what is NOT changed
 
 Input/Output contract for distillation
 ---------------------------------------
-  Input  : [B, 3, 448, 448]   (same tensor that goes into DINOv3)
-  Output : [B, 28, 28, 1024]  L2-normalised over the feature dimension
+  Input  : [B, 3, image_size, image_size]   (same tensor that goes into DINOv3)
+  Output : [B, G, G, 1024]  L2-normalised over the feature dimension
                                — directly comparable to teacher_grid
 """
 
@@ -253,8 +253,10 @@ class MobileViTBlock(nn.Module):
 
 # Teacher output dimension (DINOv3 ViT-L/16)
 TEACHER_DIM = 1024
-# Required spatial grid to match teacher's 448px / patch_size_16 = 28x28
-TEACHER_GRID = 28
+# Effective output stride after the last stride-2 MobileViT downsampling was
+# removed. DINOv3 ViT-L/16 also uses 16 px patch tokens, so any square input
+# divisible by 16 gives matching teacher/student spatial grids.
+OUTPUT_STRIDE = 16
 
 
 class MobileViT(nn.Module):
@@ -262,13 +264,13 @@ class MobileViT(nn.Module):
     MobileViT backbone with two architectural adjustments for dense distillation.
 
     Distillation-specific changes (see module docstring for full derivation):
-      1. mv2[6] stride = 1  (was 2) — keeps spatial resolution at 28×28
+      1. mv2[6] stride = 1  (was 2) — keeps output stride at 16
          after the last downsampling stage instead of collapsing to 14×14.
       2. conv2 output = TEACHER_DIM (1024)  — 1×1 conv already present in the
          backbone; its output width is set to match the teacher's feature dim
          without any additional layer being introduced.
       3. pool and fc are removed; the distillation forward returns the dense
-         [B, 28, 28, 1024] feature map.
+         [B, G, G, 1024] feature map.
 
     For classification use, pass num_classes and call forward(x).
     For distillation, call forward_distill(x).
@@ -289,12 +291,13 @@ class MobileViT(nn.Module):
         ph, pw = patch_size
         assert ih % ph == 0 and iw % pw == 0
 
-        # Distillation requires 448×448 input so that stride-product-16 yields 28×28.
-        assert ih == 448 and iw == 448, (
-            f"MobileViT distillation variant requires image_size=(448, 448), "
-            f"got ({ih}, {iw}). The stride product is 16 (last stride-2 removed), "
-            f"so 448/16 = 28x28 grid matching DINOv3's patch grid."
+        assert ih % OUTPUT_STRIDE == 0 and iw % OUTPUT_STRIDE == 0, (
+            f"MobileViT distillation variant requires image_size divisible by "
+            f"{OUTPUT_STRIDE}, got ({ih}, {iw})."
         )
+        self.image_size = (ih, iw)
+        self.output_stride = OUTPUT_STRIDE
+        self.grid_size = (ih // OUTPUT_STRIDE, iw // OUTPUT_STRIDE)
 
         L = [2, 4, 3]
 
@@ -309,8 +312,7 @@ class MobileViT(nn.Module):
         self.mv2.append(MV2Block(channels[5], channels[6], 2, expansion))
         # ── Change 1: stride 2 → 1 ──────────────────────────────────────────
         # Original: MV2Block(channels[7], channels[8], 2, expansion)
-        # Spatial after this block was 448/32 = 14×14.
-        # With stride=1, spatial stays at 448/16 = 28×28, matching the teacher.
+        # With stride=1, spatial stays at image_size/16, matching the teacher.
         # MV2Block asserts stride ∈ {1, 2} — this is explicitly supported.
         self.mv2.append(MV2Block(channels[7], channels[8], 1, expansion))
         # ────────────────────────────────────────────────────────────────────
@@ -318,8 +320,7 @@ class MobileViT(nn.Module):
         self.mvit = nn.ModuleList([])
         self.mvit.append(MobileViTBlock(dims[0], L[0], channels[5], kernel_size, patch_size, int(dims[0] * 2)))
         self.mvit.append(MobileViTBlock(dims[1], L[1], channels[7], kernel_size, patch_size, int(dims[1] * 4)))
-        # mvit[2] now receives a 28×28 feature map (same as mvit[1]).
-        # Its transformer sees seq_len = (28/2)×(28/2) = 196 tokens per patch group.
+        # mvit[2] now receives the image_size/16 feature map.
         self.mvit.append(MobileViTBlock(dims[2], L[2], channels[9], kernel_size, patch_size, int(dims[2] * 4)))
 
         # ── Change 2: conv2 output = TEACHER_DIM (1024) ─────────────────────
@@ -330,8 +331,7 @@ class MobileViT(nn.Module):
         # ────────────────────────────────────────────────────────────────────
 
         # Classification head — kept for non-distillation use.
-        # Pool kernel: ih // 16 = 448 // 16 = 28 (stride product changed from 32 to 16).
-        self.pool = nn.AvgPool2d(ih // 16, 1)
+        self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Linear(TEACHER_DIM, num_classes, bias=False)
 
     # ------------------------------------------------------------------
@@ -340,22 +340,12 @@ class MobileViT(nn.Module):
 
     def _extract_features(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Returns the dense feature map [B, TEACHER_DIM, 28, 28] before any
+        Returns the dense feature map [B, TEACHER_DIM, G, G] before any
         pooling or classification.
 
-        Spatial trace at 448×448:
-          conv1   stride 2  →  224×224
-          mv2[0]  stride 1  →  224×224
-          mv2[1]  stride 2  →  112×112
-          mv2[2]  stride 1  →  112×112
-          mv2[3]  stride 1  →  112×112  (repeat)
-          mv2[4]  stride 2  →   56×56
-          mvit[0]           →   56×56   (dims[0] transformer)
-          mv2[5]  stride 2  →   28×28
-          mvit[1]           →   28×28   (dims[1] transformer)
-          mv2[6]  stride 1  →   28×28   ← stride changed from 2 to 1
-          mvit[2]           →   28×28   (dims[2] transformer)
-          conv2             →   28×28  ×  1024
+        Spatial trace:
+          conv1/mv2/mvit stack downsamples by 16 overall.
+          conv2             →   image_size/16 × image_size/16 × 1024
         """
         x = self.conv1(x)
         x = self.mv2[0](x)
@@ -384,16 +374,16 @@ class MobileViT(nn.Module):
         Dense feature extraction for knowledge distillation.
 
         Args:
-            x: [B, 3, 448, 448]  — same tensor fed to DINOv3
+            x: [B, 3, image_size, image_size]  — same tensor fed to DINOv3
 
         Returns:
-            [B, 28, 28, 1024]  L2-normalised over dim=-1
+            [B, G, G, 1024]  L2-normalised over dim=-1
                                Directly comparable to teacher_grid produced by:
-                                 patch_tokens.reshape(B, 28, 28, 1024)
+                                 patch_tokens.reshape(B, G, G, 1024)
                                  F.normalize(..., p=2, dim=-1)
         """
-        feat = self._extract_features(x)         # [B, 1024, 28, 28]
-        feat = feat.permute(0, 2, 3, 1)          # [B, 28, 28, 1024]
+        feat = self._extract_features(x)         # [B, 1024, G, G]
+        feat = feat.permute(0, 2, 3, 1)          # [B, G, G, 1024]
         feat = F.normalize(feat, p=2, dim=-1)    # unit vectors over feature dim
         return feat
 
@@ -403,19 +393,19 @@ class MobileViT(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Standard classification forward. Pool kernel = ih//16 = 28.
+        Standard classification forward.
         """
-        x = self._extract_features(x)            # [B, 1024, 28, 28]
+        x = self._extract_features(x)            # [B, 1024, G, G]
         x = self.pool(x).view(-1, x.shape[1])    # [B, 1024]
         x = self.fc(x)                           # [B, num_classes]
         return x
 
 
 # ---------------------------------------------------------------------------
-# Factory functions — image_size updated to (448, 448)
+# Factory functions
 # ---------------------------------------------------------------------------
 
-def mobilevit_xxs_distill():
+def mobilevit_xxs_distill(image_size=(448, 448)):
     """
     MobileViT-XXS adapted for 448×448 distillation.
     Backbone params ≈ 1.3 M  +  conv2 (160→1024) ≈ 0.16 M  =  ~1.5 M total.
@@ -423,20 +413,20 @@ def mobilevit_xxs_distill():
     """
     dims = [64, 80, 96]
     channels = [16, 16, 24, 24, 48, 48, 64, 64, 80, 80, 320]
-    return MobileViT((448, 448), dims, channels, num_classes=1000, expansion=2)
+    return MobileViT(image_size, dims, channels, num_classes=1000, expansion=2)
 
 
-def mobilevit_xs_distill():
+def mobilevit_xs_distill(image_size=(448, 448)):
     """
     MobileViT-XS adapted for 448×448 distillation.
     Backbone params ≈ 2.3 M  +  conv2 ≈ 0.10 M  =  ~2.4 M total.
     """
     dims = [96, 120, 144]
     channels = [16, 32, 48, 48, 64, 64, 80, 80, 96, 96, 384]
-    return MobileViT((448, 448), dims, channels, num_classes=1000)
+    return MobileViT(image_size, dims, channels, num_classes=1000)
 
 
-def mobilevit_s_distill():
+def mobilevit_s_distill(image_size=(448, 448)):
     """
     MobileViT-S adapted for 448×448 distillation.
     Backbone params ≈ 5.6 M  +  conv2 (160→1024) ≈ 0.16 M  =  ~5.8 M total.
@@ -444,7 +434,7 @@ def mobilevit_s_distill():
     """
     dims = [144, 192, 240]
     channels = [16, 32, 64, 64, 96, 96, 128, 128, 160, 160, 640]
-    return MobileViT((448, 448), dims, channels, num_classes=1000)
+    return MobileViT(image_size, dims, channels, num_classes=1000)
 
 
 def count_parameters(model):
@@ -456,19 +446,22 @@ def count_parameters(model):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    img = torch.randn(2, 3, 448, 448)
+    sizes = (448, 512)
 
-    for name, factory in [
-        ("mobilevit_xxs_distill", mobilevit_xxs_distill),
-        ("mobilevit_xs_distill",  mobilevit_xs_distill),
-        ("mobilevit_s_distill",   mobilevit_s_distill),
-    ]:
-        model = factory()
-        model.eval()
-        with torch.no_grad():
-            out = model.forward_distill(img)
-        print(f"{name}")
-        print(f"  distill output : {tuple(out.shape)}  (expected: (2, 28, 28, 1024))")
-        print(f"  L2 norm check  : {out.norm(dim=-1).mean().item():.4f}  (expected: 1.0)")
-        print(f"  params         : {count_parameters(model) / 1e6:.2f} M")
-        print()
+    for size in sizes:
+        img = torch.randn(2, 3, size, size)
+        expected_grid = size // OUTPUT_STRIDE
+        for name, factory in [
+            ("mobilevit_xxs_distill", mobilevit_xxs_distill),
+            ("mobilevit_xs_distill",  mobilevit_xs_distill),
+            ("mobilevit_s_distill",   mobilevit_s_distill),
+        ]:
+            model = factory(image_size=(size, size))
+            model.eval()
+            with torch.no_grad():
+                out = model.forward_distill(img)
+            print(f"{name} @ {size}")
+            print(f"  distill output : {tuple(out.shape)}  (expected: (2, {expected_grid}, {expected_grid}, 1024))")
+            print(f"  L2 norm check  : {out.norm(dim=-1).mean().item():.4f}  (expected: 1.0)")
+            print(f"  params         : {count_parameters(model) / 1e6:.2f} M")
+            print()

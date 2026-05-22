@@ -7,17 +7,18 @@ python3 Yolo_Seg/vit_training/dinov3_distill_training/live_distillation_mobilevi
   --image-dir /path/to/images \
   --weights /path/to/dinov3_weights.pth \
   --checkpoint-dir checkpoints \
-  --resume-from auto
+  --resume-from auto \
+  --image-size 512
 
 Knowledge distillation: DINOv3 ViT-Large/16 (teacher) → MobileViT-S (student).
 
 Tensor contract (verified by shape trace)
 ------------------------------------------
-  Teacher  x_norm_patchtokens : [B, 784, 1024]  →  [B, 28, 28, 1024]  L2-normalised
-  Student  forward_distill()  : [B, 28, 28, 1024]  L2-normalised
-  Both share the same [B, 3, 448, 448] input tensor.
+  Teacher  x_norm_patchtokens : [B, G*G, 1024]  →  [B, G, G, 1024]  L2-normalised
+  Student  forward_distill()  : [B, G, G, 1024]  L2-normalised
+  Both share the same [B, 3, image_size, image_size] input tensor.
 
-Loss: normalised-sum (sum over C=1024 feature dim, mean over B×28×28 spatial tokens)
+Loss: normalised-sum (sum over C=1024 feature dim, mean over B×G×G spatial tokens)
   See LOSS DESIGN NOTE below for the mathematical justification.
 """
 
@@ -40,9 +41,9 @@ from mobilevit_distill import mobilevit_s_distill, MobileViT, count_parameters
 # ---------------------------------------------------------------------------
 # LOSS DESIGN NOTE — "normalised sum" for dense feature distillation
 #
-# Both tensors entering the loss have shape [B, 28, 28, 1024].
+# Both tensors entering the loss have shape [B, G, G, 1024].
 #
-#   reduction='mean'  → divides by B × 28 × 28 × 1024 ≈ 25 M elements.
+#   reduction='mean'  → divides by B × G × G × 1024 elements.
 #                       A large mismatch in one of the 1024 feature dims is
 #                       diluted by the 1023 dims already well-matched.
 #                       Fine-grained per-feature errors are suppressed.
@@ -50,7 +51,7 @@ from mobilevit_distill import mobilevit_s_distill, MobileViT, count_parameters
 #   reduction='sum'   → gradient magnitude ≈ 25 M× larger than 'mean'.
 #                       Must re-tune LR every time batch size changes.
 #
-#   CHOSEN: sum over C=1024 feature dim, mean over B × 28 × 28 spatial tokens.
+#   CHOSEN: sum over C=1024 feature dim, mean over B × G × G spatial tokens.
 #
 #   MSE formula:    loss = mean_{B,H,W} [ sum_C (s_c - t_c)^2 ]
 #                        = ((s - t)**2).sum(dim=-1).mean()
@@ -74,8 +75,9 @@ from mobilevit_distill import mobilevit_s_distill, MobileViT, count_parameters
 # ---------------------------------------------------------------------------
 
 class LiveAugmentationDataset(Dataset):
-    def __init__(self, image_dir: str):
+    def __init__(self, image_dir: str, image_size: int = 448):
         self.directory = Path(image_dir)
+        self.image_size = int(image_size)
         self.image_paths = [
             p for p in self.directory.rglob("*")
             if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
@@ -83,7 +85,7 @@ class LiveAugmentationDataset(Dataset):
         # Same normalisation as DINOv3 pretraining — critical so that teacher
         # and student receive identically pre-processed tensors.
         self.transform = transforms.Compose([
-            transforms.RandomResizedCrop(448, scale=(0.8, 1.0)),
+            transforms.RandomResizedCrop(self.image_size, scale=(0.8, 1.0)),
             transforms.RandomHorizontalFlip(),
             transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
             transforms.ToTensor(),
@@ -115,9 +117,9 @@ class DistillExportWrapper(nn.Module):
 def mse_loss_sum_features(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
     """
     Sum squared error over the C=1024 feature dimension,
-    then mean over batch × spatial positions (B × 28 × 28).
+    then mean over batch × spatial positions (B × G × G).
 
-    Input shapes: [B, 28, 28, 1024]   (both L2-normalised)
+    Input shapes: [B, G, G, 1024]   (both L2-normalised)
     Returns:      scalar
 
     Every patch token contributes its total feature reconstruction error —
@@ -129,9 +131,9 @@ def mse_loss_sum_features(student: torch.Tensor, teacher: torch.Tensor) -> torch
 def cosine_loss_sum_features(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
     """
     (1 − cosine_similarity) over the C=1024 feature dimension,
-    then mean over B × 28 × 28.
+    then mean over B × G × G.
 
-    Input shapes: [B, 28, 28, 1024]   (both L2-normalised)
+    Input shapes: [B, G, G, 1024]   (both L2-normalised)
     Returns:      scalar
 
     On unit-norm vectors, cosine_similarity = dot product, so this is
@@ -139,7 +141,7 @@ def cosine_loss_sum_features(student: torch.Tensor, teacher: torch.Tensor) -> to
     without the awkward ones tensor.
     Penalises directional misalignment orthogonally to MSE's magnitude signal.
     """
-    cos_sim = F.cosine_similarity(student, teacher, dim=-1)  # [B, 28, 28]
+    cos_sim = F.cosine_similarity(student, teacher, dim=-1)  # [B, G, G]
     return (1.0 - cos_sim).mean()
 
 
@@ -152,6 +154,7 @@ def save_torchscript_checkpoint(
     epoch: int,
     avg_loss: float,
     checkpoint_dir: str = "checkpoints",
+    image_size: int = 448,
     optimizer=None,
     scheduler=None,
     scaler=None,
@@ -173,7 +176,9 @@ def save_torchscript_checkpoint(
 
     student.eval()
     # Dummy input: CPU, matches training resolution exactly
-    dummy_input = torch.randn(1, 3, 448, 448)
+    image_size = int(image_size)
+    grid_size = image_size // 16
+    dummy_input = torch.randn(1, 3, image_size, image_size)
 
     ts_path = ckpt_dir / f"student_mobilevit_2M_dinov3_epoch{epoch:04d}.pt"
     saved_ts = False
@@ -203,9 +208,10 @@ def save_torchscript_checkpoint(
         "torchscript_saved": saved_ts,
         "model_type": "mobilevit_distill",
         "feature_dim": 1024,
-        "train_img_size": 448,
-        "train_grid_size": 28,
-        "inference_note": "forward_distill supports 512 input as a 32x32 grid",
+        "train_img_size": image_size,
+        "train_grid_size": grid_size,
+        "output_stride": 16,
+        "inference_note": "forward_distill supports any square input divisible by 16",
     }
     if optimizer is not None:
         ckpt["optimizer_state_dict"] = optimizer.state_dict()
@@ -242,6 +248,7 @@ def load_distill_checkpoint(
     scheduler=None,
     scaler=None,
     device="cpu",
+    expected_image_size: int = None,
 ) -> tuple:
     """
     Load a full or legacy student checkpoint.
@@ -255,6 +262,17 @@ def load_distill_checkpoint(
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         student.load_state_dict(ckpt["model_state_dict"], strict=True)
+        saved_img_size = ckpt.get("train_img_size")
+        if expected_image_size is not None and saved_img_size is not None:
+            if int(saved_img_size) != int(expected_image_size):
+                old_grid = ckpt.get("train_grid_size", "?")
+                new_grid = int(expected_image_size) // 16
+                print(
+                    f"[Resume] Checkpoint was trained at image_size={saved_img_size} "
+                    f"(grid={old_grid}); continuing at image_size={expected_image_size} "
+                    f"(grid={new_grid}). Model weights are compatible because the "
+                    "MobileViT distill backbone is fully spatial."
+                )
         if optimizer is not None and "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if scheduler is not None and "scheduler_state_dict" in ckpt:
@@ -287,18 +305,25 @@ def live_distillation(
     checkpoint_every: int = 5,
     checkpoint_dir: str = "checkpoints",
     resume_from: str = "",
+    image_size: int = 448,
 ) -> None:
+
+    image_size = int(image_size)
+    if image_size % 16 != 0:
+        raise ValueError(f"image_size must be divisible by 16 for DINOv3 ViT-L/16, got {image_size}")
+    expected_grid = image_size // 16
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = device.type == "cuda"
     print(f"Initialising Live Distillation on: {device}")
+    print(f"Image size: {image_size}x{image_size}  ->  target grid: {expected_grid}x{expected_grid}")
 
     # ------------------------------------------------------------------ #
     # A.  Frozen Teacher — DINOv3 ViT-Large/16                            #
     #                                                                      #
     # Output used: features["x_norm_patchtokens"]                         #
-    #   Shape: [B, 784, 1024]  →  reshaped to [B, 28, 28, 1024]           #
-    #   Derivation: 448px input / patch_size 16 = 28×28 = 784 tokens      #
+    #   Shape: [B, G*G, 1024]  →  reshaped to [B, G, G, 1024]             #
+    #   Derivation: image_size / patch_size 16 = G                         #
     #   Then L2-normalised over dim=-1 to form the distillation target.   #
     # ------------------------------------------------------------------ #
     print("Loading Teacher Model (Frozen) ...")
@@ -317,16 +342,16 @@ def live_distillation(
     # B.  Trainable Student — MobileViT-S (distillation variant)          #
     #                                                                      #
     # Architectural changes over original MobileViT-S:                    #
-    #   1. mv2[6] stride = 1 (was 2): keeps spatial at 28×28.             #
-    #      Derivation: 448/stride_product_16 = 28×28  ✓                   #
+    #   1. mv2[6] stride = 1 (was 2): keeps stride product at 16.          #
+    #      Derivation: image_size/16 = G, matching the teacher grid.       #
     #   2. conv2 output = 1024 (was 640): matches teacher feature dim.     #
     #      This is the existing 1×1 conv inside MobileViT — not a head.   #
     #   3. pool and fc removed from distillation forward path.             #
     #                                                                      #
-    # forward_distill(x) output: [B, 28, 28, 1024]  L2-normalised         #
+    # forward_distill(x) output: [B, G, G, 1024]  L2-normalised           #
     # ------------------------------------------------------------------ #
     print("Loading Student Model (MobileViT-S, distillation variant) ...")
-    student = mobilevit_s_distill().to(device)
+    student = mobilevit_s_distill(image_size=(image_size, image_size)).to(device)
     print(f"  Student parameters: {count_parameters(student) / 1e6:.2f} M  (all trainable)")
 
     optimizer = optim.AdamW(student.parameters(), lr=lr, weight_decay=1e-4)
@@ -335,7 +360,7 @@ def live_distillation(
     # ------------------------------------------------------------------ #
     # C.  Data and Mixed Precision Scaler                                  #
     # ------------------------------------------------------------------ #
-    dataset    = LiveAugmentationDataset(image_dir)
+    dataset    = LiveAugmentationDataset(image_dir, image_size=image_size)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -359,6 +384,7 @@ def live_distillation(
         scheduler=scheduler,
         scaler=scaler,
         device=device,
+        expected_image_size=image_size,
     )
     student.to(device)
 
@@ -386,17 +412,22 @@ def live_distillation(
 
                 # --- Teacher target (frozen, no gradients) ---
                 #
-                # DINOv3 ViT-L/16 at 448px:
-                #   x_norm_patchtokens: [B, 784, 1024]
-                #   reshaped to:        [B, 28, 28, 1024]
+                # DINOv3 ViT-L/16:
+                #   x_norm_patchtokens: [B, G*G, 1024]
+                #   reshaped to:        [B, G, G, 1024]
                 #   L2-normalised over dim=-1  (each token is a unit vector)
                 with torch.no_grad():
                     features     = teacher.forward_features(images)
-                    patch_tokens = features["x_norm_patchtokens"]          # [B, 784, 1024]
+                    patch_tokens = features["x_norm_patchtokens"]          # [B, G*G, 1024]
                     grid_size = int(math.sqrt(patch_tokens.shape[1]))
                     if grid_size * grid_size != patch_tokens.shape[1]:
                         raise ValueError(
                             f"Teacher patch token count is not square: {patch_tokens.shape[1]}"
+                        )
+                    if grid_size != expected_grid:
+                        raise ValueError(
+                            f"Teacher grid is {grid_size}x{grid_size}, expected "
+                            f"{expected_grid}x{expected_grid} for image_size={image_size}."
                         )
                     teacher_grid = patch_tokens.reshape(
                         images.shape[0], grid_size, grid_size, -1
@@ -405,19 +436,24 @@ def live_distillation(
 
                 # --- Student prediction (with gradients) ---
                 #
-                # MobileViT-S distillation variant at 448px:
-                #   stride product = 16  →  448/16 = 28×28 spatial grid
+                # MobileViT-S distillation variant:
+                #   stride product = 16  →  image_size/16 = G spatial grid
                 #   conv2 output dim = 1024  →  matches teacher feature dim
-                #   forward_distill: [B, 1024, 28, 28] → permute → L2-norm
-                #   output: [B, 28, 28, 1024]  (unit vectors, same as teacher)
-                student_grid = student.forward_distill(images)             # [B, 28, 28, 1024]
+                #   forward_distill: [B, 1024, G, G] → permute → L2-norm
+                #   output: [B, G, G, 1024]  (unit vectors, same as teacher)
+                student_grid = student.forward_distill(images)             # [B, G, G, 1024]
+                if student_grid.shape[1:3] != teacher_grid.shape[1:3]:
+                    raise ValueError(
+                        f"Student grid {tuple(student_grid.shape[1:3])} does not "
+                        f"match teacher grid {tuple(teacher_grid.shape[1:3])}."
+                    )
 
                 # --- Normalised-sum losses ---
                 #
-                # MSE:    sum_C (s−t)²  then mean over B×28×28
+                # MSE:    sum_C (s−t)²  then mean over B×G×G
                 #         → total reconstruction error per token, batch-stable
                 #
-                # Cosine: (1 − cos_sim_C(s, t))  then mean over B×28×28
+                # Cosine: (1 − cos_sim_C(s, t))  then mean over B×G×G
                 #         → directional alignment, complements MSE
                 #
                 # Both losses are bounded and batch-size-independent.
@@ -448,6 +484,7 @@ def live_distillation(
                 epoch,
                 avg_loss,
                 checkpoint_dir,
+                image_size=image_size,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 scaler=scaler,
@@ -462,6 +499,7 @@ def live_distillation(
         epochs,
         avg_loss,
         checkpoint_dir,
+        image_size=image_size,
         optimizer=optimizer,
         scheduler=scheduler,
         scaler=scaler,
@@ -487,6 +525,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--resume-from", default="",
                         help="'auto', a checkpoint path, or empty string for fresh training.")
+    parser.add_argument("--image-size", type=int, default=448,
+                        help="Square crop size. Must be divisible by 16. Use 512 for 32x32 features.")
     args = parser.parse_args()
 
     live_distillation(
@@ -498,4 +538,5 @@ if __name__ == "__main__":
         checkpoint_every=args.checkpoint_every,
         checkpoint_dir=args.checkpoint_dir,
         resume_from=args.resume_from,
+        image_size=args.image_size,
     )
