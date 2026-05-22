@@ -34,7 +34,7 @@ class FlatImageDataset(Dataset):
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TRAIN_DIR  = '/workspace/datasets/AUV_Datasets_Clean/train'
-BATCH_SIZE = 4
+BATCH_SIZE = 64
 NUM_WORKERS = 1
 # ─────────────────────────────────────────────────────────────────────────────
 

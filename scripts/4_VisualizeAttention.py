@@ -103,8 +103,8 @@ def main():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--image_dir", required=True)
     parser.add_argument("--output_dir", default="/workspace/outputs/attention_maps")
-    parser.add_argument("--n_images", type=int, default=6)
-    parser.add_argument("--img_size", type=int, default=224)
+    parser.add_argument("--n_images", type=int, default=4)
+    parser.add_argument("--img_size", type=int, default=512)
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
