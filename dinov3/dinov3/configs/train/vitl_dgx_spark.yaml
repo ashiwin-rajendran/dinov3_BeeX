@@ -37,10 +37,12 @@ ibot:
   # separate_head: true
   # head_norm_last_layer: false
 train:
-  batch_size_per_gpu: 64
+  batch_size_per_gpu: 16
   dataset_path: "AUVDataset:root=/workspace/datasets/AUV_Datasets_Clean:split=train"
-  num_workers: 16
+  num_workers: 18
   OFFICIAL_EPOCH_LENGTH: 1250
+  compile: false
+  # cudagraphs: true 
 
   # output_dir: /checkpoint/dino/qas/rope/vitl16_im1k
   # saveckp_freq: 20
@@ -62,6 +64,9 @@ student:
   drop_path_rate: 0.4
   layerscale: 1.0e-05
   ffn_layer: mlp
+  fp8_enabled: True
+  fp8_filter: "blocks"
+  pretrained_weights: '/workspace/weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth' 
 
   # CUSTOM CONFIGS
   # block_chunks: 0                   
@@ -70,7 +75,6 @@ student:
   # interpolate_offset: 0.1
 
   # patch_drop: 0.0
-  # pretrained_weights: ''
   # ffn_ratio: 4.0
   # resume_from_teacher_chkpt: ''
   # qkv_bias: true
@@ -134,8 +138,8 @@ crops:
   local_crops_scale:
   - 0.05
   - 0.32
-  global_crops_size: 224 # Global crop size; in our case use 512
-  local_crops_size: 96
+  global_crops_size: 512 # Global crop size; in our case use 512
+  local_crops_size: 128
   share_color_jitter: false
   horizontal_flips: true
 
