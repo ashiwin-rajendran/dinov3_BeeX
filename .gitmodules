@@ -1,0 +1,4 @@
+[submodule "dinov3"]
+	path = dinov3
+	url = https://github.com/ashiwin-rajendran/dinov3_BeeX.git
+	branch = main
