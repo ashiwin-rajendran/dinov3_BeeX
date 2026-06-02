@@ -6,9 +6,9 @@ USAGE:
 python3 Yolo_Seg/vit_training/dinov3_distill_training/live_distillation_mobilevit.py \
   --image-dir /path/to/images \
   --weights /path/to/dinov3_weights.pth \
-  --checkpoint-dir checkpoints \
-  --resume-from auto \
-  --image-size 512
+  --checkpoint-dir checkpoints_split_norm_448 \
+  --init-from /path/to/legacy_epoch0005.pth \
+  --image-size 448
 
 Knowledge distillation: DINOv3 ViT-Large/16 (teacher) → MobileViT-S (student).
 
@@ -16,7 +16,7 @@ Tensor contract (verified by shape trace)
 ------------------------------------------
   Teacher  x_norm_patchtokens : [B, G*G, 1024]  →  [B, G, G, 1024]  L2-normalised
   Student  forward_distill()  : [B, G, G, 1024]  L2-normalised
-  Both share the same [B, 3, image_size, image_size] input tensor.
+  Both share the same augmented image, then use branch-specific normalisation.
 
 Loss: normalised-sum (sum over C=1024 feature dim, mean over B×G×G spatial tokens)
   See LOSS DESIGN NOTE below for the mathematical justification.
@@ -33,9 +33,28 @@ from pathlib import Path
 from tqdm import tqdm
 import argparse
 import math
+import os
 import re
+import sys
+
+VIT_SCRIPTS_DIR = Path(os.environ.get(
+    "VIT_SCRIPTS_DIR",
+    Path(__file__).resolve().parents[2] / "scripts",
+))
+if not VIT_SCRIPTS_DIR.is_dir():
+    raise ImportError(f"Shared ViT architecture directory not found: {VIT_SCRIPTS_DIR}")
+if str(VIT_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(VIT_SCRIPTS_DIR))
 
 from mobilevit_distill import mobilevit_s_distill, MobileViT, count_parameters
+import torchvision.transforms.functional as TF
+
+
+TEACHER_MEAN = (0.485, 0.456, 0.406)
+TEACHER_STD = (0.229, 0.224, 0.225)
+STUDENT_MEAN = (0.5118, 0.5094, 0.5125)
+STUDENT_STD = (0.1240, 0.1278, 0.1188)
+PREPROCESSING_CONTRACT = "dinov3_imagenet_teacher__beex_student_v1"
 
 
 # ---------------------------------------------------------------------------
@@ -82,14 +101,12 @@ class LiveAugmentationDataset(Dataset):
             p for p in self.directory.rglob("*")
             if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
         ]
-        # Same normalisation as DINOv3 pretraining — critical so that teacher
-        # and student receive identically pre-processed tensors.
+        # Normalisation is branch-specific and applied inside the training loop.
         self.transform = transforms.Compose([
             transforms.RandomResizedCrop(self.image_size, scale=(0.8, 1.0)),
             transforms.RandomHorizontalFlip(),
             transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
             transforms.ToTensor(),
-            transforms.Normalize(mean=(0.5118, 0.5094, 0.5125), std=(0.1240, 0.1278, 0.1188)),
         ])
 
     def __len__(self) -> int:
@@ -212,6 +229,9 @@ def save_torchscript_checkpoint(
         "train_grid_size": grid_size,
         "output_stride": 16,
         "inference_note": "forward_distill supports any square input divisible by 16",
+        "preprocessing_contract": PREPROCESSING_CONTRACT,
+        "teacher_normalization": {"mean": TEACHER_MEAN, "std": TEACHER_STD},
+        "student_normalization": {"mean": STUDENT_MEAN, "std": STUDENT_STD},
     }
     if optimizer is not None:
         ckpt["optimizer_state_dict"] = optimizer.state_dict()
@@ -251,7 +271,7 @@ def load_distill_checkpoint(
     expected_image_size: int = None,
 ) -> tuple:
     """
-    Load a full or legacy student checkpoint.
+    Resume a tagged checkpoint created with the current preprocessing contract.
 
     Returns:
         start_epoch, avg_loss
@@ -261,6 +281,13 @@ def load_distill_checkpoint(
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        saved_contract = ckpt.get("preprocessing_contract")
+        if saved_contract != PREPROCESSING_CONTRACT:
+            raise ValueError(
+                "[Resume] Checkpoint preprocessing contract is missing or incompatible. "
+                "Use --init-from to reuse its student weights with a fresh optimiser "
+                "and scheduler."
+            )
         student.load_state_dict(ckpt["model_state_dict"], strict=True)
         saved_img_size = ckpt.get("train_img_size")
         if expected_image_size is not None and saved_img_size is not None:
@@ -284,12 +311,36 @@ def load_distill_checkpoint(
         print(f"[Resume] Loaded full checkpoint: {ckpt_path}")
         return epoch + 1, avg_loss
 
-    student.load_state_dict(ckpt, strict=True)
-    match = re.search(r"epoch[_-]?(\d+)", Path(ckpt_path).name)
-    epoch = int(match.group(1)) if match else 0
-    print(f"[Resume] Loaded legacy model-only checkpoint: {ckpt_path}")
-    print("[Resume] Optimizer/scheduler/scaler state unavailable; they will restart.")
-    return epoch + 1, 0.0
+    raise ValueError(
+        "[Resume] Raw model-only checkpoints cannot be used for exact resume. "
+        "Use --init-from to warm-start a fresh experiment."
+    )
+
+
+def load_initial_student_weights(
+    ckpt_path: str,
+    student: MobileViT,
+    device="cpu",
+) -> None:
+    """Warm-start student weights without restoring training state."""
+    if not ckpt_path:
+        return
+
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+        source_epoch = ckpt.get("epoch", "?")
+        source_contract = ckpt.get("preprocessing_contract", "legacy-or-unknown")
+    else:
+        state_dict = ckpt
+        source_epoch = "?"
+        source_contract = "raw-model-state"
+
+    student.load_state_dict(state_dict, strict=True)
+    print(f"[Init] Warm-started student weights: {ckpt_path}")
+    print(f"       Source epoch: {source_epoch}")
+    print(f"       Source preprocessing contract: {source_contract}")
+    print("       Fresh optimiser, scheduler, scaler, and epoch counter will be used.")
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +356,7 @@ def live_distillation(
     checkpoint_every: int = 5,
     checkpoint_dir: str = "checkpoints",
     resume_from: str = "",
+    init_from: str = "",
     image_size: int = 448,
 ) -> None:
 
@@ -371,6 +423,9 @@ def live_distillation(
     )
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
+    if resume_from and init_from:
+        raise ValueError("Use only one of --resume-from or --init-from, not both.")
+
     if resume_from == "auto":
         resume_from = get_latest_checkpoint(checkpoint_dir)
         if resume_from:
@@ -378,15 +433,19 @@ def live_distillation(
         else:
             print("[Resume] No checkpoint found in checkpoint_dir; starting fresh.")
 
-    start_epoch, avg_loss = load_distill_checkpoint(
-        resume_from,
-        student,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-        device=device,
-        expected_image_size=image_size,
-    )
+    if init_from:
+        load_initial_student_weights(init_from, student, device=device)
+        start_epoch, avg_loss = 1, 0.0
+    else:
+        start_epoch, avg_loss = load_distill_checkpoint(
+            resume_from,
+            student,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            device=device,
+            expected_image_size=image_size,
+        )
     student.to(device)
 
     if start_epoch > epochs:
@@ -405,6 +464,19 @@ def live_distillation(
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
         for images in pbar:
             images = images.to(device)
+
+            teacher_images = TF.normalize(
+                images,
+                mean=TEACHER_MEAN,
+                std=TEACHER_STD,
+            )
+
+            student_images = TF.normalize(
+                images,
+                mean=STUDENT_MEAN,
+                std=STUDENT_STD,
+            )
+
             optimizer.zero_grad()
 
             with torch.amp.autocast(device_type=device.type,
@@ -418,7 +490,7 @@ def live_distillation(
                 #   reshaped to:        [B, G, G, 1024]
                 #   L2-normalised over dim=-1  (each token is a unit vector)
                 with torch.no_grad():
-                    features     = teacher.forward_features(images)
+                    features = teacher.forward_features(teacher_images)
                     patch_tokens = features["x_norm_patchtokens"]          # [B, G*G, 1024]
                     grid_size = int(math.sqrt(patch_tokens.shape[1]))
                     if grid_size * grid_size != patch_tokens.shape[1]:
@@ -442,7 +514,7 @@ def live_distillation(
                 #   conv2 output dim = 1024  →  matches teacher feature dim
                 #   forward_distill: [B, 1024, G, G] → permute → L2-norm
                 #   output: [B, G, G, 1024]  (unit vectors, same as teacher)
-                student_grid = student.forward_distill(images)             # [B, G, G, 1024]
+                student_grid = student.forward_distill(student_images) # [B, G, G, 1024]
                 if student_grid.shape[1:3] != teacher_grid.shape[1:3]:
                     raise ValueError(
                         f"Student grid {tuple(student_grid.shape[1:3])} does not "
@@ -526,6 +598,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--resume-from", default="",
                         help="'auto', a checkpoint path, or empty string for fresh training.")
+    parser.add_argument("--init-from", default="",
+                        help="Warm-start student weights only; resets optimiser, scheduler, scaler, and epoch.")
     parser.add_argument("--image-size", type=int, default=448,
                         help="Square crop size. Must be divisible by 16. Use 512 for 32x32 features.")
     args = parser.parse_args()
@@ -539,5 +613,27 @@ if __name__ == "__main__":
         checkpoint_every=args.checkpoint_every,
         checkpoint_dir=args.checkpoint_dir,
         resume_from=args.resume_from,
+        init_from=args.init_from,
         image_size=args.image_size,
     )
+
+# For first corrected run:
+
+# python3 live_distillation_mobilevit.py \
+#   --image-dir /workspace/Datasets_VIT \
+#   --weights /workspace/Pretrained_Dino_based_MVIT_Distillation/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth \
+#   --image-size 448 \
+#   --batch-size 145 \
+#   --epochs 50 \
+#   --checkpoint-every 1 \
+#   --checkpoint-dir checkpoints_split_norm_448 \
+#   --init-from checkpoints/student_mobilevit_2M_Dinov3_based_epoch0005.pth
+
+# Resume after interruption
+
+# python3 live_distillation_mobilevit.py \
+#   --image-size 448 \
+#   --batch-size 145 \
+#   --epochs 50 \
+#   --checkpoint-dir checkpoints_split_norm_448 \
+#   --resume-from auto
