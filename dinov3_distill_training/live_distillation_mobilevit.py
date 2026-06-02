@@ -89,7 +89,7 @@ class LiveAugmentationDataset(Dataset):
             transforms.RandomHorizontalFlip(),
             transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
             transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            transforms.Normalize(mean=(0.5118, 0.5094, 0.5125), std=(0.1240, 0.1278, 0.1188)),
         ])
 
     def __len__(self) -> int:
@@ -336,7 +336,8 @@ def live_distillation(
     teacher.to(device).eval()
     for param in teacher.parameters():
         param.requires_grad = False
-    print(f"  Teacher parameters: {count_parameters(teacher) / 1e6:.1f} M  (all frozen)")
+    total_teacher = sum(p.numel() for p in teacher.parameters()) / 1e6
+    print(f"  Teacher parameters: {total_teacher:.1f} M  (all frozen)")
 
     # ------------------------------------------------------------------ #
     # B.  Trainable Student — MobileViT-S (distillation variant)          #
