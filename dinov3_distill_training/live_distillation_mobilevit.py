@@ -52,8 +52,8 @@ import torchvision.transforms.functional as TF
 
 TEACHER_MEAN = (0.485, 0.456, 0.406)
 TEACHER_STD = (0.229, 0.224, 0.225)
-STUDENT_MEAN = (0.5118, 0.5094, 0.5125)
-STUDENT_STD = (0.1240, 0.1278, 0.1188)
+STUDENT_MEAN = (0.4743, 0.5000, 0.4715)
+STUDENT_STD = (0.1319, 0.1335, 0.1367)
 PREPROCESSING_CONTRACT = "dinov3_imagenet_teacher__beex_student_v1"
 
 
