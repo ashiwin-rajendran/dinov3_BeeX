@@ -7,8 +7,8 @@ class AUVDataset(Dataset):
 
     EXTENSIONS = {'.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG'}
 
-    MEAN = [0.5118, 0.5094, 0.5125]
-    STD  = [0.1240, 0.1278, 0.1188]
+    MEAN = [0.4743, 0.5000, 0.4715]
+    STD  = [0.1319, 0.1335, 0.1367]
 
     def __init__(self, root, split='train', transform=None,
                  target_transform=None, transforms=None, **kwargs):
