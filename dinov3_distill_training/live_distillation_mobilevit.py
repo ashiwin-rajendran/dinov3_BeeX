@@ -33,6 +33,7 @@ from pathlib import Path
 from tqdm import tqdm
 import argparse
 import math
+import numpy as np
 import os
 import re
 import sys
@@ -47,6 +48,7 @@ if str(VIT_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(VIT_SCRIPTS_DIR))
 
 from mobilevit_distill import mobilevit_s_distill, MobileViT, count_parameters
+from sonar_feature_engineering import make_sonar_features
 import torchvision.transforms.functional as TF
 
 
@@ -54,7 +56,9 @@ TEACHER_MEAN = (0.485, 0.456, 0.406)
 TEACHER_STD = (0.229, 0.224, 0.225)
 STUDENT_MEAN = (0.4743, 0.5000, 0.4715)
 STUDENT_STD = (0.1319, 0.1335, 0.1367)
-PREPROCESSING_CONTRACT = "dinov3_imagenet_teacher__beex_student_v1"
+SONAR_FEATURE_MEAN = (0.091898, 0.132347, 0.114527)
+SONAR_FEATURE_STD = (0.172297, 0.202109, 0.186716)
+RGB_PREPROCESSING_CONTRACT = "dinov3_imagenet_teacher__beex_student_v1"
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +97,51 @@ PREPROCESSING_CONTRACT = "dinov3_imagenet_teacher__beex_student_v1"
 # 1.  Dataset
 # ---------------------------------------------------------------------------
 
+def parse_triplet(value: str, name: str) -> tuple:
+    parts = [float(part.strip()) for part in value.split(",") if part.strip()]
+    if len(parts) != 3:
+        raise ValueError(f"{name} must contain three comma-separated numbers, got: {value}")
+    return tuple(parts)
+
+
+def preprocessing_contract(
+    input_mode: str,
+    student_mean: tuple,
+    student_std: tuple,
+    sonar_middle_channel: str,
+    sonar_wavelet: str,
+    sonar_occupancy_threshold: int,
+) -> str:
+    if input_mode == "rgb":
+        return RGB_PREPROCESSING_CONTRACT
+    mean_key = "_".join(f"{v:.6f}" for v in student_mean)
+    std_key = "_".join(f"{v:.6f}" for v in student_std)
+    return (
+        "dinov3_imagenet_teacher__sonar_student"
+        f"__{sonar_middle_channel}"
+        f"__wavelet_{sonar_wavelet}"
+        f"__occ_{sonar_occupancy_threshold}"
+        f"__mean_{mean_key}"
+        f"__std_{std_key}"
+    )
+
+
 class LiveAugmentationDataset(Dataset):
-    def __init__(self, image_dir: str, image_size: int = 448):
+    def __init__(
+        self,
+        image_dir: str,
+        image_size: int = 448,
+        input_mode: str = "rgb",
+        sonar_middle_channel: str = "wavelet_low",
+        sonar_wavelet: str = "haar",
+        sonar_occupancy_threshold: int = 128,
+    ):
         self.directory = Path(image_dir)
         self.image_size = int(image_size)
+        self.input_mode = input_mode
+        self.sonar_middle_channel = sonar_middle_channel
+        self.sonar_wavelet = sonar_wavelet
+        self.sonar_occupancy_threshold = int(sonar_occupancy_threshold)
         self.image_paths = [
             p for p in self.directory.rglob("*")
             if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
@@ -112,9 +157,38 @@ class LiveAugmentationDataset(Dataset):
     def __len__(self) -> int:
         return len(self.image_paths)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        image = Image.open(self.image_paths[idx]).convert("RGB")
-        return self.transform(image)
+    def __getitem__(self, idx: int):
+        image = Image.open(self.image_paths[idx])
+        if self.input_mode == "rgb":
+            return self.transform(image.convert("RGB"))
+        if self.input_mode != "sonar_features":
+            raise ValueError(f"Unsupported input_mode: {self.input_mode}")
+
+        gray = image.convert("L")
+        crop_params = transforms.RandomResizedCrop.get_params(
+            gray,
+            scale=(0.8, 1.0),
+            ratio=(3.0 / 4.0, 4.0 / 3.0),
+        )
+        gray = TF.resized_crop(
+            gray,
+            *crop_params,
+            size=(self.image_size, self.image_size),
+            interpolation=transforms.InterpolationMode.BILINEAR,
+        )
+        if torch.rand(1).item() < 0.5:
+            gray = TF.hflip(gray)
+
+        gray_np = np.asarray(gray, dtype=np.uint8)
+        teacher_image = TF.to_tensor(gray.convert("RGB"))
+        student_features = make_sonar_features(
+            gray_np,
+            middle_channel=self.sonar_middle_channel,
+            wavelet=self.sonar_wavelet,
+            occupancy_threshold=self.sonar_occupancy_threshold,
+        )
+        student_image = torch.from_numpy(student_features).permute(2, 0, 1).float()
+        return teacher_image, student_image
 
 
 class DistillExportWrapper(nn.Module):
@@ -172,6 +246,10 @@ def save_torchscript_checkpoint(
     avg_loss: float,
     checkpoint_dir: str = "checkpoints",
     image_size: int = 448,
+    preprocessing_contract: str = RGB_PREPROCESSING_CONTRACT,
+    student_mean: tuple = STUDENT_MEAN,
+    student_std: tuple = STUDENT_STD,
+    input_mode: str = "rgb",
     optimizer=None,
     scheduler=None,
     scaler=None,
@@ -229,9 +307,10 @@ def save_torchscript_checkpoint(
         "train_grid_size": grid_size,
         "output_stride": 16,
         "inference_note": "forward_distill supports any square input divisible by 16",
-        "preprocessing_contract": PREPROCESSING_CONTRACT,
+        "input_mode": input_mode,
+        "preprocessing_contract": preprocessing_contract,
         "teacher_normalization": {"mean": TEACHER_MEAN, "std": TEACHER_STD},
-        "student_normalization": {"mean": STUDENT_MEAN, "std": STUDENT_STD},
+        "student_normalization": {"mean": student_mean, "std": student_std},
     }
     if optimizer is not None:
         ckpt["optimizer_state_dict"] = optimizer.state_dict()
@@ -269,6 +348,7 @@ def load_distill_checkpoint(
     scaler=None,
     device="cpu",
     expected_image_size: int = None,
+    expected_preprocessing_contract: str = RGB_PREPROCESSING_CONTRACT,
 ) -> tuple:
     """
     Resume a tagged checkpoint created with the current preprocessing contract.
@@ -282,7 +362,7 @@ def load_distill_checkpoint(
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         saved_contract = ckpt.get("preprocessing_contract")
-        if saved_contract != PREPROCESSING_CONTRACT:
+        if saved_contract != expected_preprocessing_contract:
             raise ValueError(
                 "[Resume] Checkpoint preprocessing contract is missing or incompatible. "
                 "Use --init-from to reuse its student weights with a fresh optimiser "
@@ -358,17 +438,41 @@ def live_distillation(
     resume_from: str = "",
     init_from: str = "",
     image_size: int = 448,
+    input_mode: str = "rgb",
+    student_mean: tuple = None,
+    student_std: tuple = None,
+    sonar_middle_channel: str = "wavelet_low",
+    sonar_wavelet: str = "haar",
+    sonar_occupancy_threshold: int = 128,
 ) -> None:
 
     image_size = int(image_size)
     if image_size % 16 != 0:
         raise ValueError(f"image_size must be divisible by 16 for DINOv3 ViT-L/16, got {image_size}")
     expected_grid = image_size // 16
+    if input_mode not in {"rgb", "sonar_features"}:
+        raise ValueError("--input-mode must be either 'rgb' or 'sonar_features'")
+    if student_mean is None:
+        student_mean = SONAR_FEATURE_MEAN if input_mode == "sonar_features" else STUDENT_MEAN
+    if student_std is None:
+        student_std = SONAR_FEATURE_STD if input_mode == "sonar_features" else STUDENT_STD
+    run_contract = preprocessing_contract(
+        input_mode=input_mode,
+        student_mean=student_mean,
+        student_std=student_std,
+        sonar_middle_channel=sonar_middle_channel,
+        sonar_wavelet=sonar_wavelet,
+        sonar_occupancy_threshold=sonar_occupancy_threshold,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = device.type == "cuda"
     print(f"Initialising Live Distillation on: {device}")
     print(f"Image size: {image_size}x{image_size}  ->  target grid: {expected_grid}x{expected_grid}")
+    print(f"Input mode: {input_mode}")
+    if input_mode == "sonar_features":
+        print(f"  Student channels: raw_robust, {sonar_middle_channel}, sobel_edge")
+    print(f"  Student norm mean={student_mean} std={student_std}")
 
     # ------------------------------------------------------------------ #
     # A.  Frozen Teacher — DINOv3 ViT-Large/16                            #
@@ -413,7 +517,16 @@ def live_distillation(
     # ------------------------------------------------------------------ #
     # C.  Data and Mixed Precision Scaler                                  #
     # ------------------------------------------------------------------ #
-    dataset    = LiveAugmentationDataset(image_dir, image_size=image_size)
+    dataset    = LiveAugmentationDataset(
+        image_dir,
+        image_size=image_size,
+        input_mode=input_mode,
+        sonar_middle_channel=sonar_middle_channel,
+        sonar_wavelet=sonar_wavelet,
+        sonar_occupancy_threshold=sonar_occupancy_threshold,
+    )
+    if len(dataset) == 0:
+        raise FileNotFoundError(f"No images found under {image_dir}")
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -445,6 +558,7 @@ def live_distillation(
             scaler=scaler,
             device=device,
             expected_image_size=image_size,
+            expected_preprocessing_contract=run_contract,
         )
     student.to(device)
 
@@ -462,19 +576,25 @@ def live_distillation(
         running_loss = 0.0
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
-        for images in pbar:
-            images = images.to(device)
+        for batch in pbar:
+            if input_mode == "sonar_features":
+                teacher_input, student_input = batch
+                teacher_input = teacher_input.to(device)
+                student_input = student_input.to(device)
+            else:
+                teacher_input = batch.to(device)
+                student_input = teacher_input
 
             teacher_images = TF.normalize(
-                images,
+                teacher_input,
                 mean=TEACHER_MEAN,
                 std=TEACHER_STD,
             )
 
             student_images = TF.normalize(
-                images,
-                mean=STUDENT_MEAN,
-                std=STUDENT_STD,
+                student_input,
+                mean=student_mean,
+                std=student_std,
             )
 
             optimizer.zero_grad()
@@ -503,7 +623,7 @@ def live_distillation(
                             f"{expected_grid}x{expected_grid} for image_size={image_size}."
                         )
                     teacher_grid = patch_tokens.reshape(
-                        images.shape[0], grid_size, grid_size, -1
+                        teacher_input.shape[0], grid_size, grid_size, -1
                     )                                                      # [B, H, W, 1024]
                     teacher_grid = F.normalize(teacher_grid, p=2, dim=-1)
 
@@ -558,6 +678,10 @@ def live_distillation(
                 avg_loss,
                 checkpoint_dir,
                 image_size=image_size,
+                preprocessing_contract=run_contract,
+                student_mean=student_mean,
+                student_std=student_std,
+                input_mode=input_mode,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 scaler=scaler,
@@ -573,6 +697,10 @@ def live_distillation(
         avg_loss,
         checkpoint_dir,
         image_size=image_size,
+        preprocessing_contract=run_contract,
+        student_mean=student_mean,
+        student_std=student_std,
+        input_mode=input_mode,
         optimizer=optimizer,
         scheduler=scheduler,
         scaler=scaler,
@@ -602,7 +730,20 @@ if __name__ == "__main__":
                         help="Warm-start student weights only; resets optimiser, scheduler, scaler, and epoch.")
     parser.add_argument("--image-size", type=int, default=448,
                         help="Square crop size. Must be divisible by 16. Use 512 for 32x32 features.")
+    parser.add_argument("--input-mode", choices=["rgb", "sonar_features"], default="rgb",
+                        help="rgb keeps the existing RGB pipeline; sonar_features feeds engineered sonar channels to the student.")
+    parser.add_argument("--student-mean", default="",
+                        help="Comma-separated student channel mean. Defaults to BeeX RGB or sonar-feature stats by input mode.")
+    parser.add_argument("--student-std", default="",
+                        help="Comma-separated student channel std. Defaults to BeeX RGB or sonar-feature stats by input mode.")
+    parser.add_argument("--sonar-middle-channel",
+                        choices=["clahe", "occupancy", "wavelet_low", "wavelet_high"],
+                        default="wavelet_low")
+    parser.add_argument("--sonar-wavelet", default="haar")
+    parser.add_argument("--sonar-occupancy-threshold", type=int, default=128)
     args = parser.parse_args()
+    student_mean = parse_triplet(args.student_mean, "--student-mean") if args.student_mean else None
+    student_std = parse_triplet(args.student_std, "--student-std") if args.student_std else None
 
     live_distillation(
         args.image_dir,
@@ -615,25 +756,49 @@ if __name__ == "__main__":
         resume_from=args.resume_from,
         init_from=args.init_from,
         image_size=args.image_size,
+        input_mode=args.input_mode,
+        student_mean=student_mean,
+        student_std=student_std,
+        sonar_middle_channel=args.sonar_middle_channel,
+        sonar_wavelet=args.sonar_wavelet,
+        sonar_occupancy_threshold=args.sonar_occupancy_threshold,
     )
 
-# For first corrected run:
+# RGB CAM DISTILLATION - WARM UP
 
 # python3 live_distillation_mobilevit.py \
 #   --image-dir /workspace/Datasets_VIT \
 #   --weights /workspace/Pretrained_Dino_based_MVIT_Distillation/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth \
-#   --image-size 448 \
+#   --image-size 512 \
 #   --batch-size 145 \
 #   --epochs 50 \
-#   --checkpoint-every 1 \
-#   --checkpoint-dir checkpoints_split_norm_448 \
 #   --init-from checkpoints/student_mobilevit_2M_Dinov3_based_epoch0005.pth
 
-# Resume after interruption
+# SUBSEQUENT DITSILLATION RUNS
 
 # python3 live_distillation_mobilevit.py \
-#   --image-size 448 \
+#   --image-size 512 \
 #   --batch-size 145 \
 #   --epochs 50 \
-#   --checkpoint-dir checkpoints_split_norm_448 \
 #   --resume-from auto
+
+# SONAR FEATURE DISTILLATION - COMPUTE STATS ONLY (NO SAVING OF IMAGES)
+
+# python3 sonar_feature_engineering.py \
+#   --input-dir /path/to/sonar_png_folder \
+#   --output-dir /path/to/sonar_feature_stats \
+#   --middle-channel wavelet_low \
+#   --stats-only
+
+# SONAR FEATURE DISTILLATION - WARM UP
+
+# python3 live_distillation_mobilevit.py \
+#   --image-dir /path/to/sonar_png_folder \
+#   --weights /path/to/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth \
+#   --image-size 512 \
+#   --batch-size 32 \
+#   --epochs 1 \
+#   --input-mode sonar_features \
+#   --sonar-middle-channel wavelet_low \
+#   --student-mean MEAN0,MEAN1,MEAN2 \
+#   --student-std STD0,STD1,STD2
