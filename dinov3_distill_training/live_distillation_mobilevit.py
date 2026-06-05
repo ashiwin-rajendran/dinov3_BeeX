@@ -250,6 +250,9 @@ def save_torchscript_checkpoint(
     student_mean: tuple = STUDENT_MEAN,
     student_std: tuple = STUDENT_STD,
     input_mode: str = "rgb",
+    sonar_middle_channel: str = "wavelet_low",
+    sonar_wavelet: str = "haar",
+    sonar_occupancy_threshold: int = 128,
     optimizer=None,
     scheduler=None,
     scaler=None,
@@ -311,6 +314,11 @@ def save_torchscript_checkpoint(
         "preprocessing_contract": preprocessing_contract,
         "teacher_normalization": {"mean": TEACHER_MEAN, "std": TEACHER_STD},
         "student_normalization": {"mean": student_mean, "std": student_std},
+        "sonar_feature_config": {
+            "middle_channel": sonar_middle_channel,
+            "wavelet": sonar_wavelet,
+            "occupancy_threshold": int(sonar_occupancy_threshold),
+        },
     }
     if optimizer is not None:
         ckpt["optimizer_state_dict"] = optimizer.state_dict()
@@ -682,6 +690,9 @@ def live_distillation(
                 student_mean=student_mean,
                 student_std=student_std,
                 input_mode=input_mode,
+                sonar_middle_channel=sonar_middle_channel,
+                sonar_wavelet=sonar_wavelet,
+                sonar_occupancy_threshold=sonar_occupancy_threshold,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 scaler=scaler,
@@ -701,6 +712,9 @@ def live_distillation(
         student_mean=student_mean,
         student_std=student_std,
         input_mode=input_mode,
+        sonar_middle_channel=sonar_middle_channel,
+        sonar_wavelet=sonar_wavelet,
+        sonar_occupancy_threshold=sonar_occupancy_threshold,
         optimizer=optimizer,
         scheduler=scheduler,
         scaler=scaler,
