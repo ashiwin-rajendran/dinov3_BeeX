@@ -111,6 +111,8 @@ def preprocessing_contract(
     sonar_middle_channel: str,
     sonar_wavelet: str,
     sonar_occupancy_threshold: int,
+    sonar_local_contrast_blur: int,
+    sonar_edge_blur: int,
 ) -> str:
     if input_mode == "rgb":
         return RGB_PREPROCESSING_CONTRACT
@@ -121,6 +123,8 @@ def preprocessing_contract(
         f"__{sonar_middle_channel}"
         f"__wavelet_{sonar_wavelet}"
         f"__occ_{sonar_occupancy_threshold}"
+        f"__localblur_{sonar_local_contrast_blur}"
+        f"__edgeblur_{sonar_edge_blur}"
         f"__mean_{mean_key}"
         f"__std_{std_key}"
     )
@@ -135,6 +139,8 @@ class LiveAugmentationDataset(Dataset):
         sonar_middle_channel: str = "wavelet_low",
         sonar_wavelet: str = "haar",
         sonar_occupancy_threshold: int = 128,
+        sonar_local_contrast_blur: int = 31,
+        sonar_edge_blur: int = 3,
     ):
         self.directory = Path(image_dir)
         self.image_size = int(image_size)
@@ -142,6 +148,8 @@ class LiveAugmentationDataset(Dataset):
         self.sonar_middle_channel = sonar_middle_channel
         self.sonar_wavelet = sonar_wavelet
         self.sonar_occupancy_threshold = int(sonar_occupancy_threshold)
+        self.sonar_local_contrast_blur = int(sonar_local_contrast_blur)
+        self.sonar_edge_blur = int(sonar_edge_blur)
         self.image_paths = [
             p for p in self.directory.rglob("*")
             if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
@@ -186,6 +194,8 @@ class LiveAugmentationDataset(Dataset):
             middle_channel=self.sonar_middle_channel,
             wavelet=self.sonar_wavelet,
             occupancy_threshold=self.sonar_occupancy_threshold,
+            local_contrast_blur=self.sonar_local_contrast_blur,
+            edge_blur=self.sonar_edge_blur,
         )
         student_image = torch.from_numpy(student_features).permute(2, 0, 1).float()
         return teacher_image, student_image
@@ -253,6 +263,8 @@ def save_torchscript_checkpoint(
     sonar_middle_channel: str = "wavelet_low",
     sonar_wavelet: str = "haar",
     sonar_occupancy_threshold: int = 128,
+    sonar_local_contrast_blur: int = 31,
+    sonar_edge_blur: int = 3,
     optimizer=None,
     scheduler=None,
     scaler=None,
@@ -318,6 +330,8 @@ def save_torchscript_checkpoint(
             "middle_channel": sonar_middle_channel,
             "wavelet": sonar_wavelet,
             "occupancy_threshold": int(sonar_occupancy_threshold),
+            "local_contrast_blur": int(sonar_local_contrast_blur),
+            "edge_blur": int(sonar_edge_blur),
         },
     }
     if optimizer is not None:
@@ -453,6 +467,8 @@ def live_distillation(
     sonar_middle_channel: str = "wavelet_low",
     sonar_wavelet: str = "haar",
     sonar_occupancy_threshold: int = 128,
+    sonar_local_contrast_blur: int = 31,
+    sonar_edge_blur: int = 3,
 ) -> None:
 
     image_size = int(image_size)
@@ -477,6 +493,7 @@ def live_distillation(
     expected_grid = image_size // 16
     if input_mode not in {"rgb", "sonar_features"}:
         raise ValueError("--input-mode must be either 'rgb' or 'sonar_features'")
+    using_default_student_stats = student_mean is None or student_std is None
     if student_mean is None:
         student_mean = SONAR_FEATURE_MEAN if input_mode == "sonar_features" else STUDENT_MEAN
     if student_std is None:
@@ -488,6 +505,8 @@ def live_distillation(
         sonar_middle_channel=sonar_middle_channel,
         sonar_wavelet=sonar_wavelet,
         sonar_occupancy_threshold=sonar_occupancy_threshold,
+        sonar_local_contrast_blur=sonar_local_contrast_blur,
+        sonar_edge_blur=sonar_edge_blur,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -496,7 +515,16 @@ def live_distillation(
     print(f"Image size: {image_size}x{image_size}  ->  target grid: {expected_grid}x{expected_grid}")
     print(f"Input mode: {input_mode}")
     if input_mode == "sonar_features":
-        print(f"  Student channels: raw_robust, {sonar_middle_channel}, sobel_edge")
+        print(
+            f"  Student channels: raw_robust, {sonar_middle_channel}, sobel_edge "
+            f"(wavelet={sonar_wavelet}, occ={sonar_occupancy_threshold}, "
+            f"local_blur={sonar_local_contrast_blur}, edge_blur={sonar_edge_blur})"
+        )
+        if using_default_student_stats:
+            print(
+                "  [WARN] Using built-in sonar feature stats. Recompute and pass "
+                "--student-mean/--student-std when changing feature channels or datasets."
+            )
     print(f"  Student norm mean={student_mean} std={student_std}")
 
     # ------------------------------------------------------------------ #
@@ -549,6 +577,8 @@ def live_distillation(
         sonar_middle_channel=sonar_middle_channel,
         sonar_wavelet=sonar_wavelet,
         sonar_occupancy_threshold=sonar_occupancy_threshold,
+        sonar_local_contrast_blur=sonar_local_contrast_blur,
+        sonar_edge_blur=sonar_edge_blur,
     )
     if len(dataset) == 0:
         raise FileNotFoundError(f"No images found under {image_dir}")
@@ -710,6 +740,8 @@ def live_distillation(
                 sonar_middle_channel=sonar_middle_channel,
                 sonar_wavelet=sonar_wavelet,
                 sonar_occupancy_threshold=sonar_occupancy_threshold,
+                sonar_local_contrast_blur=sonar_local_contrast_blur,
+                sonar_edge_blur=sonar_edge_blur,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 scaler=scaler,
@@ -732,6 +764,8 @@ def live_distillation(
         sonar_middle_channel=sonar_middle_channel,
         sonar_wavelet=sonar_wavelet,
         sonar_occupancy_threshold=sonar_occupancy_threshold,
+        sonar_local_contrast_blur=sonar_local_contrast_blur,
+        sonar_edge_blur=sonar_edge_blur,
         optimizer=optimizer,
         scheduler=scheduler,
         scaler=scaler,
@@ -770,10 +804,12 @@ if __name__ == "__main__":
     parser.add_argument("--student-std", default="",
                         help="Comma-separated student channel std. Defaults to BeeX RGB or sonar-feature stats by input mode.")
     parser.add_argument("--sonar-middle-channel",
-                        choices=["clahe", "occupancy", "wavelet_low", "wavelet_high"],
+                        choices=["clahe", "occupancy", "wavelet_low", "wavelet_high", "local_contrast"],
                         default="wavelet_low")
     parser.add_argument("--sonar-wavelet", default="haar")
     parser.add_argument("--sonar-occupancy-threshold", type=int, default=128)
+    parser.add_argument("--sonar-local-contrast-blur", type=int, default=31)
+    parser.add_argument("--sonar-edge-blur", type=int, default=3)
     args = parser.parse_args()
     student_mean = parse_triplet(args.student_mean, "--student-mean") if args.student_mean else None
     student_std = parse_triplet(args.student_std, "--student-std") if args.student_std else None
@@ -796,6 +832,8 @@ if __name__ == "__main__":
         sonar_middle_channel=args.sonar_middle_channel,
         sonar_wavelet=args.sonar_wavelet,
         sonar_occupancy_threshold=args.sonar_occupancy_threshold,
+        sonar_local_contrast_blur=args.sonar_local_contrast_blur,
+        sonar_edge_blur=args.sonar_edge_blur,
     )
 
 # RGB CAM DISTILLATION - WARM UP
