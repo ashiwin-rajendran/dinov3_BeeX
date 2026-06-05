@@ -445,6 +445,7 @@ def live_distillation(
     checkpoint_dir: str = "checkpoints",
     resume_from: str = "",
     init_from: str = "",
+    dinov3_repo: str = "/workspace/dinov3",
     image_size: int = 448,
     input_mode: str = "rgb",
     student_mean: tuple = None,
@@ -455,8 +456,24 @@ def live_distillation(
 ) -> None:
 
     image_size = int(image_size)
+    epochs = int(epochs)
+    batch_size = int(batch_size)
+    checkpoint_every = int(checkpoint_every)
+    if epochs < 1:
+        raise ValueError(f"epochs must be >= 1, got {epochs}")
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    if checkpoint_every < 1:
+        raise ValueError(f"checkpoint_every must be >= 1, got {checkpoint_every}")
     if image_size % 16 != 0:
         raise ValueError(f"image_size must be divisible by 16 for DINOv3 ViT-L/16, got {image_size}")
+    if not Path(image_dir).is_dir():
+        raise FileNotFoundError(f"image_dir not found: {image_dir}")
+    if not Path(weights_path).is_file():
+        raise FileNotFoundError(f"DINOv3 weights not found: {weights_path}")
+    dinov3_repo = str(Path(dinov3_repo).expanduser().resolve())
+    if not Path(dinov3_repo).is_dir():
+        raise FileNotFoundError(f"DINOv3 repo not found: {dinov3_repo}")
     expected_grid = image_size // 16
     if input_mode not in {"rgb", "sonar_features"}:
         raise ValueError("--input-mode must be either 'rgb' or 'sonar_features'")
@@ -492,7 +509,7 @@ def live_distillation(
     # ------------------------------------------------------------------ #
     print("Loading Teacher Model (Frozen) ...")
     teacher = torch.hub.load(
-        "/workspace/dinov3", "dinov3_vitl16", source="local", pretrained=False
+        dinov3_repo, "dinov3_vitl16", source="local", pretrained=False
     )
     teacher.load_state_dict(
         torch.load(weights_path, map_location="cpu", weights_only=True), strict=True
@@ -742,6 +759,8 @@ if __name__ == "__main__":
                         help="'auto', a checkpoint path, or empty string for fresh training.")
     parser.add_argument("--init-from", default="",
                         help="Warm-start student weights only; resets optimiser, scheduler, scaler, and epoch.")
+    parser.add_argument("--dinov3-repo", default="/workspace/dinov3",
+                        help="Local facebookresearch/dinov3 repository path used by torch.hub.load.")
     parser.add_argument("--image-size", type=int, default=448,
                         help="Square crop size. Must be divisible by 16. Use 512 for 32x32 features.")
     parser.add_argument("--input-mode", choices=["rgb", "sonar_features"], default="rgb",
@@ -769,6 +788,7 @@ if __name__ == "__main__":
         checkpoint_dir=args.checkpoint_dir,
         resume_from=args.resume_from,
         init_from=args.init_from,
+        dinov3_repo=args.dinov3_repo,
         image_size=args.image_size,
         input_mode=args.input_mode,
         student_mean=student_mean,
