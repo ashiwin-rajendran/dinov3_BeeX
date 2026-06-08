@@ -59,6 +59,7 @@ STUDENT_STD = (0.1319, 0.1335, 0.1367)
 SONAR_FEATURE_MEAN = (0.091898, 0.132347, 0.114527)
 SONAR_FEATURE_STD = (0.172297, 0.202109, 0.186716)
 RGB_PREPROCESSING_CONTRACT = "dinov3_imagenet_teacher__beex_student_v1"
+FLS_PREPROCESSING_CONTRACT = "dinov3_imagenet_teacher__fls_sonar_greyscale_centercrop_jpeg_v1"
 
 
 # ---------------------------------------------------------------------------
@@ -116,10 +117,17 @@ def preprocessing_contract(
 ) -> str:
     if input_mode == "rgb":
         return RGB_PREPROCESSING_CONTRACT
+    if input_mode == "fls_grayscale":
+        return FLS_PREPROCESSING_CONTRACT
     mean_key = "_".join(f"{v:.6f}" for v in student_mean)
     std_key = "_".join(f"{v:.6f}" for v in student_std)
+    feature_prefix = (
+        "dinov3_imagenet_teacher__fls_sonar_features"
+        if input_mode == "fls_features"
+        else "dinov3_imagenet_teacher__sonar_student"
+    )
     return (
-        "dinov3_imagenet_teacher__sonar_student"
+        feature_prefix +
         f"__{sonar_middle_channel}"
         f"__wavelet_{sonar_wavelet}"
         f"__occ_{sonar_occupancy_threshold}"
@@ -169,6 +177,35 @@ class LiveAugmentationDataset(Dataset):
         image = Image.open(self.image_paths[idx])
         if self.input_mode == "rgb":
             return self.transform(image.convert("RGB"))
+        if self.input_mode == "fls_grayscale":
+            gray = self._center_square(image.convert("L"))
+            gray = TF.resize(
+                gray,
+                size=(self.image_size, self.image_size),
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            )
+            teacher_image = TF.to_tensor(gray.convert("RGB"))
+            student_image = TF.to_tensor(gray).mul(2.0).sub(1.0)
+            return teacher_image, student_image
+        if self.input_mode == "fls_features":
+            gray = self._center_square(image.convert("L"))
+            gray = TF.resize(
+                gray,
+                size=(self.image_size, self.image_size),
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            )
+            gray_np = np.asarray(gray, dtype=np.uint8)
+            teacher_image = TF.to_tensor(gray.convert("RGB"))
+            student_features = make_sonar_features(
+                gray_np,
+                middle_channel=self.sonar_middle_channel,
+                wavelet=self.sonar_wavelet,
+                occupancy_threshold=self.sonar_occupancy_threshold,
+                local_contrast_blur=self.sonar_local_contrast_blur,
+                edge_blur=self.sonar_edge_blur,
+            )
+            student_image = torch.from_numpy(student_features).permute(2, 0, 1).float()
+            return teacher_image, student_image
         if self.input_mode != "sonar_features":
             raise ValueError(f"Unsupported input_mode: {self.input_mode}")
 
@@ -199,6 +236,14 @@ class LiveAugmentationDataset(Dataset):
         )
         student_image = torch.from_numpy(student_features).permute(2, 0, 1).float()
         return teacher_image, student_image
+
+    @staticmethod
+    def _center_square(image: Image.Image) -> Image.Image:
+        width, height = image.size
+        side = min(width, height)
+        left = (width - side) // 2
+        top = (height - side) // 2
+        return TF.crop(image, top, left, side, side)
 
 
 class DistillExportWrapper(nn.Module):
@@ -260,6 +305,7 @@ def save_torchscript_checkpoint(
     student_mean: tuple = STUDENT_MEAN,
     student_std: tuple = STUDENT_STD,
     input_mode: str = "rgb",
+    in_channels: int = 3,
     sonar_middle_channel: str = "wavelet_low",
     sonar_wavelet: str = "haar",
     sonar_occupancy_threshold: int = 128,
@@ -288,7 +334,8 @@ def save_torchscript_checkpoint(
     # Dummy input: CPU, matches training resolution exactly
     image_size = int(image_size)
     grid_size = image_size // 16
-    dummy_input = torch.randn(1, 3, image_size, image_size)
+    in_channels = int(in_channels)
+    dummy_input = torch.randn(1, in_channels, image_size, image_size)
 
     ts_path = ckpt_dir / f"student_mobilevit_2M_dinov3_epoch{epoch:04d}.pt"
     saved_ts = False
@@ -311,13 +358,28 @@ def save_torchscript_checkpoint(
 
     # Full checkpoint always written regardless of TorchScript outcome.
     pth_path = ckpt_dir / f"student_mobilevit_2M_Dinov3_based_epoch{epoch:04d}.pth"
+    if input_mode == "fls_grayscale":
+        model_type = "mobilevit_distill_fls_sonar_greyscale"
+        student_normalization = {
+            "formula": "float = uint8 / 127.5 - 1.0",
+            "mean": [0.0],
+            "std": [1.0],
+        }
+    elif input_mode == "fls_features":
+        model_type = "mobilevit_distill_fls_sonar_features"
+        student_normalization = {"mean": student_mean, "std": student_std}
+    else:
+        model_type = "mobilevit_distill"
+        student_normalization = {"mean": student_mean, "std": student_std}
+
     ckpt = {
         "epoch": epoch,
         "avg_loss": avg_loss,
         "model_state_dict": student.state_dict(),
         "torchscript_saved": saved_ts,
-        "model_type": "mobilevit_distill",
+        "model_type": model_type,
         "feature_dim": 1024,
+        "in_channels": in_channels,
         "train_img_size": image_size,
         "train_grid_size": grid_size,
         "output_stride": 16,
@@ -325,7 +387,7 @@ def save_torchscript_checkpoint(
         "input_mode": input_mode,
         "preprocessing_contract": preprocessing_contract,
         "teacher_normalization": {"mean": TEACHER_MEAN, "std": TEACHER_STD},
-        "student_normalization": {"mean": student_mean, "std": student_std},
+        "student_normalization": student_normalization,
         "sonar_feature_config": {
             "middle_channel": sonar_middle_channel,
             "wavelet": sonar_wavelet,
@@ -491,13 +553,16 @@ def live_distillation(
     if not Path(dinov3_repo).is_dir():
         raise FileNotFoundError(f"DINOv3 repo not found: {dinov3_repo}")
     expected_grid = image_size // 16
-    if input_mode not in {"rgb", "sonar_features"}:
-        raise ValueError("--input-mode must be either 'rgb' or 'sonar_features'")
+    if input_mode not in {"rgb", "sonar_features", "fls_grayscale", "fls_features"}:
+        raise ValueError("--input-mode must be 'rgb', 'sonar_features', 'fls_grayscale', or 'fls_features'")
     using_default_student_stats = student_mean is None or student_std is None
+    if input_mode == "fls_grayscale":
+        student_mean = (0.0,)
+        student_std = (1.0,)
     if student_mean is None:
-        student_mean = SONAR_FEATURE_MEAN if input_mode == "sonar_features" else STUDENT_MEAN
+        student_mean = SONAR_FEATURE_MEAN if input_mode in {"sonar_features", "fls_features"} else STUDENT_MEAN
     if student_std is None:
-        student_std = SONAR_FEATURE_STD if input_mode == "sonar_features" else STUDENT_STD
+        student_std = SONAR_FEATURE_STD if input_mode in {"sonar_features", "fls_features"} else STUDENT_STD
     run_contract = preprocessing_contract(
         input_mode=input_mode,
         student_mean=student_mean,
@@ -514,18 +579,24 @@ def live_distillation(
     print(f"Initialising Live Distillation on: {device}")
     print(f"Image size: {image_size}x{image_size}  ->  target grid: {expected_grid}x{expected_grid}")
     print(f"Input mode: {input_mode}")
-    if input_mode == "sonar_features":
+    if input_mode in {"sonar_features", "fls_features"}:
         print(
             f"  Student channels: raw_robust, {sonar_middle_channel}, sobel_edge "
             f"(wavelet={sonar_wavelet}, occ={sonar_occupancy_threshold}, "
             f"local_blur={sonar_local_contrast_blur}, edge_blur={sonar_edge_blur})"
         )
+        if input_mode == "fls_features":
+            print("  FLS geometry: center-crop square, resize, no random crop")
         if using_default_student_stats:
             print(
                 "  [WARN] Using built-in sonar feature stats. Recompute and pass "
                 "--student-mean/--student-std when changing feature channels or datasets."
             )
-    print(f"  Student norm mean={student_mean} std={student_std}")
+    elif input_mode == "fls_grayscale":
+        print("  Student channels: grayscale")
+        print("  Student norm: uint8/127.5 - 1.0")
+    else:
+        print(f"  Student norm mean={student_mean} std={student_std}")
 
     # ------------------------------------------------------------------ #
     # A.  Frozen Teacher — DINOv3 ViT-Large/16                            #
@@ -561,7 +632,11 @@ def live_distillation(
     # forward_distill(x) output: [B, G, G, 1024]  L2-normalised           #
     # ------------------------------------------------------------------ #
     print("Loading Student Model (MobileViT-S, distillation variant) ...")
-    student = mobilevit_s_distill(image_size=(image_size, image_size)).to(device)
+    student_in_channels = 1 if input_mode == "fls_grayscale" else 3
+    student = mobilevit_s_distill(
+        image_size=(image_size, image_size),
+        in_channels=student_in_channels,
+    ).to(device)
     print(f"  Student parameters: {count_parameters(student) / 1e6:.2f} M  (all trainable)")
 
     optimizer = optim.AdamW(student.parameters(), lr=lr, weight_decay=1e-4)
@@ -632,7 +707,7 @@ def live_distillation(
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
         for batch in pbar:
-            if input_mode == "sonar_features":
+            if input_mode in {"sonar_features", "fls_grayscale", "fls_features"}:
                 teacher_input, student_input = batch
                 teacher_input = teacher_input.to(device)
                 student_input = student_input.to(device)
@@ -646,11 +721,14 @@ def live_distillation(
                 std=TEACHER_STD,
             )
 
-            student_images = TF.normalize(
-                student_input,
-                mean=student_mean,
-                std=student_std,
-            )
+            if input_mode == "fls_grayscale":
+                student_images = student_input
+            else:
+                student_images = TF.normalize(
+                    student_input,
+                    mean=student_mean,
+                    std=student_std,
+                )
 
             optimizer.zero_grad()
 
@@ -737,6 +815,7 @@ def live_distillation(
                 student_mean=student_mean,
                 student_std=student_std,
                 input_mode=input_mode,
+                in_channels=student_in_channels,
                 sonar_middle_channel=sonar_middle_channel,
                 sonar_wavelet=sonar_wavelet,
                 sonar_occupancy_threshold=sonar_occupancy_threshold,
@@ -761,6 +840,7 @@ def live_distillation(
         student_mean=student_mean,
         student_std=student_std,
         input_mode=input_mode,
+        in_channels=student_in_channels,
         sonar_middle_channel=sonar_middle_channel,
         sonar_wavelet=sonar_wavelet,
         sonar_occupancy_threshold=sonar_occupancy_threshold,
@@ -797,8 +877,8 @@ if __name__ == "__main__":
                         help="Local facebookresearch/dinov3 repository path used by torch.hub.load.")
     parser.add_argument("--image-size", type=int, default=448,
                         help="Square crop size. Must be divisible by 16. Use 512 for 32x32 features.")
-    parser.add_argument("--input-mode", choices=["rgb", "sonar_features"], default="rgb",
-                        help="rgb keeps the existing RGB pipeline; sonar_features feeds engineered sonar channels to the student.")
+    parser.add_argument("--input-mode", choices=["rgb", "sonar_features", "fls_grayscale", "fls_features"], default="rgb",
+                        help="rgb keeps the camera pipeline; sonar_features uses engineered bounded-mosaic channels; fls_grayscale uses one-channel FLS sonar; fls_features uses engineered FLS channels.")
     parser.add_argument("--student-mean", default="",
                         help="Comma-separated student channel mean. Defaults to BeeX RGB or sonar-feature stats by input mode.")
     parser.add_argument("--student-std", default="",
@@ -846,7 +926,7 @@ if __name__ == "__main__":
 #   --epochs 50 \
 #   --init-from checkpoints/student_mobilevit_2M_Dinov3_based_epoch0005.pth
 
-# SUBSEQUENT DITSILLATION RUNS
+# SUBSEQUENT DISTILLATION RUNS
 
 # python3 live_distillation_mobilevit.py \
 #   --image-size 512 \
@@ -854,18 +934,18 @@ if __name__ == "__main__":
 #   --epochs 50 \
 #   --resume-from auto
 
-# SONAR FEATURE DISTILLATION - COMPUTE STATS ONLY (NO SAVING OF IMAGES)
+# BOUNDED MOSAIC FEATURE DISTILLATION - COMPUTE STATS ONLY
 
 # python3 sonar_feature_engineering.py \
-#   --input-dir /path/to/sonar_png_folder \
-#   --output-dir /path/to/sonar_feature_stats \
+#   --input-dir /path/to/bounded_mosaic_images \
+#   --output-dir /path/to/bounded_mosaic_feature_stats \
 #   --middle-channel wavelet_low \
 #   --stats-only
 
-# SONAR FEATURE DISTILLATION - WARM UP
+# BOUNDED MOSAIC FEATURE DISTILLATION - WARM UP
 
 # python3 live_distillation_mobilevit.py \
-#   --image-dir /path/to/sonar_png_folder \
+#   --image-dir /path/to/bounded_mosaic_images \
 #   --weights /path/to/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth \
 #   --image-size 512 \
 #   --batch-size 32 \
@@ -874,3 +954,40 @@ if __name__ == "__main__":
 #   --sonar-middle-channel wavelet_low \
 #   --student-mean MEAN0,MEAN1,MEAN2 \
 #   --student-std STD0,STD1,STD2
+
+# FLS GRAYSCALE DISTILLATION - ONE CHANNEL
+
+# python3 live_distillation_mobilevit.py \
+#   --image-dir /path/to/fls_images \
+#   --weights /path/to/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth \
+#   --dinov3-repo /path/to/dinov3 \
+#   --input-mode fls_grayscale \
+#   --image-size 512 \
+#   --batch-size 64 \
+#   --epochs 3 \
+#   --checkpoint-every 1 \
+#   --checkpoint-dir checkpoints_fls_grayscale_probe
+
+# FLS FEATURE DISTILLATION - THREE CHANNELS
+
+# python3 sonar_feature_engineering.py \
+#   --input-dir /path/to/fls_images \
+#   --output-dir /path/to/fls_feature_stats \
+#   --middle-channel occupancy \
+#   --occupancy-threshold 40 \
+#   --stats-only
+
+# python3 live_distillation_mobilevit.py \
+#   --image-dir /path/to/fls_images \
+#   --weights /path/to/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth \
+#   --dinov3-repo /path/to/dinov3 \
+#   --input-mode fls_features \
+#   --sonar-middle-channel occupancy \
+#   --sonar-occupancy-threshold 40 \
+#   --student-mean MEAN0,MEAN1,MEAN2 \
+#   --student-std STD0,STD1,STD2 \
+#   --image-size 512 \
+#   --batch-size 64 \
+#   --epochs 3 \
+#   --checkpoint-every 1 \
+#   --checkpoint-dir checkpoints_fls_features_probe
