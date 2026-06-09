@@ -110,6 +110,7 @@ def preprocessing_contract(
     student_mean: tuple,
     student_std: tuple,
     sonar_middle_channel: str,
+    sonar_third_channel: str,
     sonar_wavelet: str,
     sonar_occupancy_threshold: int,
     sonar_local_contrast_blur: int,
@@ -129,6 +130,7 @@ def preprocessing_contract(
     return (
         feature_prefix +
         f"__{sonar_middle_channel}"
+        f"__third_{sonar_third_channel}"
         f"__wavelet_{sonar_wavelet}"
         f"__occ_{sonar_occupancy_threshold}"
         f"__localblur_{sonar_local_contrast_blur}"
@@ -145,6 +147,7 @@ class LiveAugmentationDataset(Dataset):
         image_size: int = 448,
         input_mode: str = "rgb",
         sonar_middle_channel: str = "wavelet_low",
+        sonar_third_channel: str = "sobel_edge",
         sonar_wavelet: str = "haar",
         sonar_occupancy_threshold: int = 128,
         sonar_local_contrast_blur: int = 31,
@@ -154,6 +157,7 @@ class LiveAugmentationDataset(Dataset):
         self.image_size = int(image_size)
         self.input_mode = input_mode
         self.sonar_middle_channel = sonar_middle_channel
+        self.sonar_third_channel = sonar_third_channel
         self.sonar_wavelet = sonar_wavelet
         self.sonar_occupancy_threshold = int(sonar_occupancy_threshold)
         self.sonar_local_contrast_blur = int(sonar_local_contrast_blur)
@@ -203,6 +207,7 @@ class LiveAugmentationDataset(Dataset):
                 occupancy_threshold=self.sonar_occupancy_threshold,
                 local_contrast_blur=self.sonar_local_contrast_blur,
                 edge_blur=self.sonar_edge_blur,
+                third_channel=self.sonar_third_channel,
             )
             student_image = torch.from_numpy(student_features).permute(2, 0, 1).float()
             return teacher_image, student_image
@@ -233,6 +238,7 @@ class LiveAugmentationDataset(Dataset):
             occupancy_threshold=self.sonar_occupancy_threshold,
             local_contrast_blur=self.sonar_local_contrast_blur,
             edge_blur=self.sonar_edge_blur,
+            third_channel=self.sonar_third_channel,
         )
         student_image = torch.from_numpy(student_features).permute(2, 0, 1).float()
         return teacher_image, student_image
@@ -307,6 +313,7 @@ def save_torchscript_checkpoint(
     input_mode: str = "rgb",
     in_channels: int = 3,
     sonar_middle_channel: str = "wavelet_low",
+    sonar_third_channel: str = "sobel_edge",
     sonar_wavelet: str = "haar",
     sonar_occupancy_threshold: int = 128,
     sonar_local_contrast_blur: int = 31,
@@ -390,6 +397,7 @@ def save_torchscript_checkpoint(
         "student_normalization": student_normalization,
         "sonar_feature_config": {
             "middle_channel": sonar_middle_channel,
+            "third_channel": sonar_third_channel,
             "wavelet": sonar_wavelet,
             "occupancy_threshold": int(sonar_occupancy_threshold),
             "local_contrast_blur": int(sonar_local_contrast_blur),
@@ -527,6 +535,7 @@ def live_distillation(
     student_mean: tuple = None,
     student_std: tuple = None,
     sonar_middle_channel: str = "wavelet_low",
+    sonar_third_channel: str = "sobel_edge",
     sonar_wavelet: str = "haar",
     sonar_occupancy_threshold: int = 128,
     sonar_local_contrast_blur: int = 31,
@@ -568,6 +577,7 @@ def live_distillation(
         student_mean=student_mean,
         student_std=student_std,
         sonar_middle_channel=sonar_middle_channel,
+        sonar_third_channel=sonar_third_channel,
         sonar_wavelet=sonar_wavelet,
         sonar_occupancy_threshold=sonar_occupancy_threshold,
         sonar_local_contrast_blur=sonar_local_contrast_blur,
@@ -581,7 +591,7 @@ def live_distillation(
     print(f"Input mode: {input_mode}")
     if input_mode in {"sonar_features", "fls_features"}:
         print(
-            f"  Student channels: raw_robust, {sonar_middle_channel}, sobel_edge "
+            f"  Student channels: raw_robust, {sonar_middle_channel}, {sonar_third_channel} "
             f"(wavelet={sonar_wavelet}, occ={sonar_occupancy_threshold}, "
             f"local_blur={sonar_local_contrast_blur}, edge_blur={sonar_edge_blur})"
         )
@@ -650,6 +660,7 @@ def live_distillation(
         image_size=image_size,
         input_mode=input_mode,
         sonar_middle_channel=sonar_middle_channel,
+        sonar_third_channel=sonar_third_channel,
         sonar_wavelet=sonar_wavelet,
         sonar_occupancy_threshold=sonar_occupancy_threshold,
         sonar_local_contrast_blur=sonar_local_contrast_blur,
@@ -817,6 +828,7 @@ def live_distillation(
                 input_mode=input_mode,
                 in_channels=student_in_channels,
                 sonar_middle_channel=sonar_middle_channel,
+                sonar_third_channel=sonar_third_channel,
                 sonar_wavelet=sonar_wavelet,
                 sonar_occupancy_threshold=sonar_occupancy_threshold,
                 sonar_local_contrast_blur=sonar_local_contrast_blur,
@@ -842,6 +854,7 @@ def live_distillation(
         input_mode=input_mode,
         in_channels=student_in_channels,
         sonar_middle_channel=sonar_middle_channel,
+        sonar_third_channel=sonar_third_channel,
         sonar_wavelet=sonar_wavelet,
         sonar_occupancy_threshold=sonar_occupancy_threshold,
         sonar_local_contrast_blur=sonar_local_contrast_blur,
@@ -884,8 +897,11 @@ if __name__ == "__main__":
     parser.add_argument("--student-std", default="",
                         help="Comma-separated student channel std. Defaults to BeeX RGB or sonar-feature stats by input mode.")
     parser.add_argument("--sonar-middle-channel",
-                        choices=["clahe", "occupancy", "wavelet_low", "wavelet_high", "local_contrast"],
+                        choices=["clahe", "occupancy", "inverse_occupancy", "wavelet_low", "wavelet_high", "local_contrast"],
                         default="wavelet_low")
+    parser.add_argument("--sonar-third-channel",
+                        choices=["sobel_edge", "local_contrast", "raw_robust"],
+                        default="sobel_edge")
     parser.add_argument("--sonar-wavelet", default="haar")
     parser.add_argument("--sonar-occupancy-threshold", type=int, default=128)
     parser.add_argument("--sonar-local-contrast-blur", type=int, default=31)
@@ -910,6 +926,7 @@ if __name__ == "__main__":
         student_mean=student_mean,
         student_std=student_std,
         sonar_middle_channel=args.sonar_middle_channel,
+        sonar_third_channel=args.sonar_third_channel,
         sonar_wavelet=args.sonar_wavelet,
         sonar_occupancy_threshold=args.sonar_occupancy_threshold,
         sonar_local_contrast_blur=args.sonar_local_contrast_blur,
@@ -973,7 +990,8 @@ if __name__ == "__main__":
 # python3 sonar_feature_engineering.py \
 #   --input-dir /path/to/fls_images \
 #   --output-dir /path/to/fls_feature_stats \
-#   --middle-channel occupancy \
+#   --middle-channel inverse_occupancy \
+#   --third-channel local_contrast \
 #   --occupancy-threshold 40 \
 #   --stats-only
 
@@ -982,7 +1000,8 @@ if __name__ == "__main__":
 #   --weights /path/to/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth \
 #   --dinov3-repo /path/to/dinov3 \
 #   --input-mode fls_features \
-#   --sonar-middle-channel occupancy \
+#   --sonar-middle-channel inverse_occupancy \
+#   --sonar-third-channel local_contrast \
 #   --sonar-occupancy-threshold 40 \
 #   --student-mean MEAN0,MEAN1,MEAN2 \
 #   --student-std STD0,STD1,STD2 \
