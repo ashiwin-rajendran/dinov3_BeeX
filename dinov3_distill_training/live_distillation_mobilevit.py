@@ -32,11 +32,18 @@ from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
 import argparse
+import json
 import math
 import numpy as np
 import os
 import re
 import sys
+import time
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 VIT_SCRIPTS_DIR = Path(os.environ.get(
     "VIT_SCRIPTS_DIR",
@@ -60,6 +67,46 @@ SONAR_FEATURE_MEAN = (0.091898, 0.132347, 0.114527)
 SONAR_FEATURE_STD = (0.172297, 0.202109, 0.186716)
 RGB_PREPROCESSING_CONTRACT = "dinov3_imagenet_teacher__beex_student_v1"
 FLS_PREPROCESSING_CONTRACT = "dinov3_imagenet_teacher__fls_sonar_greyscale_centercrop_jpeg_v1"
+
+DEFAULT_RUN_CONFIG = {
+    "image_dir": "/workspace/Datasets_VIT",
+    "weights": "/workspace/Pretrained_Dino_based_MVIT_Distillation/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
+    "epochs": 50,
+    "batch_size": 128,
+    "lr": 1e-3,
+    "checkpoint_every": 1,
+    "checkpoint_dir": "checkpoints",
+    "resume_from": "",
+    "init_from": "",
+    "dinov3_repo": "/workspace/dinov3",
+    "image_size": 448,
+    "input_mode": "rgb",
+    "student_mean": None,
+    "student_std": None,
+    "sonar_middle_channel": "wavelet_low",
+    "sonar_third_channel": "sobel_edge",
+    "sonar_wavelet": "haar",
+    "sonar_occupancy_threshold": 128,
+    "sonar_local_contrast_blur": 31,
+    "sonar_edge_blur": 3,
+    "lambda_sigreg": 0.0,
+    "sigreg_max_tokens": 2048,
+    "sigreg_projections": 256,
+    "sigreg_warmup_epochs": 0,
+}
+
+CONFIG_GROUP_KEYS = {
+    "paths",
+    "training",
+    "data",
+    "input",
+    "sonar",
+    "loss",
+    "sigreg",
+    "resume",
+    "checkpoint",
+    "checkpoints",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -98,11 +145,125 @@ FLS_PREPROCESSING_CONTRACT = "dinov3_imagenet_teacher__fls_sonar_greyscale_cente
 # 1.  Dataset
 # ---------------------------------------------------------------------------
 
-def parse_triplet(value: str, name: str) -> tuple:
+def parse_triplet(value, name: str) -> tuple:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (list, tuple)):
+        parts = [float(part) for part in value]
+        if len(parts) != 3:
+            raise ValueError(f"{name} must contain three values, got: {value}")
+        return tuple(parts)
     parts = [float(part.strip()) for part in value.split(",") if part.strip()]
     if len(parts) != 3:
         raise ValueError(f"{name} must contain three comma-separated numbers, got: {value}")
     return tuple(parts)
+
+
+def normalise_config_key(key: str) -> str:
+    key = str(key).strip().replace("-", "_")
+    aliases = {
+        "weights_path": "weights",
+        "dinov3_weights": "weights",
+        "checkpoint_every_n_epochs": "checkpoint_every",
+        "resume": "resume_from",
+        "init": "init_from",
+    }
+    return aliases.get(key, key)
+
+
+def flatten_run_config(data: dict) -> dict:
+    flat = {}
+    for key, value in data.items():
+        normalised_key = normalise_config_key(key)
+        if isinstance(value, dict) and normalised_key in CONFIG_GROUP_KEYS:
+            flat.update(flatten_run_config(value))
+        else:
+            flat[normalised_key] = value
+    return flat
+
+
+def load_yaml_run_config(path: str) -> dict:
+    if not path:
+        return {}
+    if yaml is None:
+        raise ImportError("PyYAML is required for --config. Install it with: pip install pyyaml")
+    config_path = Path(path).expanduser()
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with config_path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file must contain a YAML mapping: {path}")
+    return flatten_run_config(data)
+
+
+def serialise_value(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return [serialise_value(item) for item in value]
+    if isinstance(value, list):
+        return [serialise_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): serialise_value(item) for key, item in value.items()}
+    return value
+
+
+def write_run_config_files(
+    checkpoint_dir: str,
+    run_config: dict,
+    config_path: str = "",
+    runtime_info: dict = None,
+) -> None:
+    ckpt_dir = Path(checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "config_path": str(config_path or ""),
+        "run_config": serialise_value(run_config),
+        "runtime": serialise_value(runtime_info or {}),
+    }
+
+    json_path = ckpt_dir / "training_config_resolved.json"
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+    if yaml is not None:
+        yaml_path = ckpt_dir / "training_config_resolved.yaml"
+        with yaml_path.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(payload, handle, sort_keys=False)
+
+    if config_path:
+        source_path = Path(config_path).expanduser()
+        if source_path.is_file():
+            source_copy_path = ckpt_dir / "training_config_source.yaml"
+            source_copy_path.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def append_training_log(checkpoint_dir: str, record: dict) -> None:
+    ckpt_dir = Path(checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = ckpt_dir / "training_log.jsonl"
+    with jsonl_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(serialise_value(record), sort_keys=True) + "\n")
+
+    csv_path = ckpt_dir / "training_log.csv"
+    csv_columns = [
+        "epoch",
+        "avg_loss",
+        "avg_mse",
+        "avg_cosine",
+        "avg_sigreg",
+        "lambda_sigreg",
+        "lr",
+        "epoch_seconds",
+    ]
+    write_header = not csv_path.exists()
+    with csv_path.open("a", encoding="utf-8") as handle:
+        if write_header:
+            handle.write(",".join(csv_columns) + "\n")
+        handle.write(",".join(str(record.get(column, "")) for column in csv_columns) + "\n")
 
 
 def preprocessing_contract(
@@ -591,6 +752,8 @@ def live_distillation(
     sigreg_max_tokens: int = 2048,
     sigreg_projections: int = 256,
     sigreg_warmup_epochs: int = 0,
+    config_path: str = "",
+    run_config: dict = None,
 ) -> None:
 
     image_size = int(image_size)
@@ -646,6 +809,33 @@ def live_distillation(
         sonar_local_contrast_blur=sonar_local_contrast_blur,
         sonar_edge_blur=sonar_edge_blur,
     )
+    resolved_run_config = dict(run_config or {})
+    resolved_run_config.update({
+        "image_dir": image_dir,
+        "weights": weights_path,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "lr": float(lr),
+        "checkpoint_every": checkpoint_every,
+        "checkpoint_dir": checkpoint_dir,
+        "resume_from": resume_from,
+        "init_from": init_from,
+        "dinov3_repo": dinov3_repo,
+        "image_size": image_size,
+        "input_mode": input_mode,
+        "student_mean": student_mean,
+        "student_std": student_std,
+        "sonar_middle_channel": sonar_middle_channel,
+        "sonar_third_channel": sonar_third_channel,
+        "sonar_wavelet": sonar_wavelet,
+        "sonar_occupancy_threshold": int(sonar_occupancy_threshold),
+        "sonar_local_contrast_blur": int(sonar_local_contrast_blur),
+        "sonar_edge_blur": int(sonar_edge_blur),
+        "lambda_sigreg": lambda_sigreg,
+        "sigreg_max_tokens": sigreg_max_tokens,
+        "sigreg_projections": sigreg_projections,
+        "sigreg_warmup_epochs": sigreg_warmup_epochs,
+    })
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = device.type == "cuda"
@@ -771,6 +961,24 @@ def live_distillation(
             expected_preprocessing_contract=run_contract,
         )
     student.to(device)
+    resolved_run_config["resume_from"] = resume_from
+
+    write_run_config_files(
+        checkpoint_dir,
+        resolved_run_config,
+        config_path=config_path,
+        runtime_info={
+            "device": str(device),
+            "amp_enabled": amp_enabled,
+            "dataset_images": len(dataset),
+            "dataloader_batches": len(dataloader),
+            "expected_grid": expected_grid,
+            "preprocessing_contract": run_contract,
+            "start_epoch": start_epoch,
+            "teacher": "dinov3_vitl16",
+            "student": "mobilevit_s_distill",
+        },
+    )
 
     if start_epoch > epochs:
         print(f"[Resume] Checkpoint epoch is already >= target epochs ({epochs}). Nothing to train.")
@@ -782,6 +990,8 @@ def live_distillation(
     # D.  Training Loop                                                    #
     # ------------------------------------------------------------------ #
     for epoch in range(start_epoch, epochs + 1):
+        epoch_start_time = time.time()
+        epoch_lr = optimizer.param_groups[0]["lr"]
         student.train()
         running_loss = 0.0
         running_mse = 0.0
@@ -903,14 +1113,31 @@ def live_distillation(
 
         scheduler.step()
         avg_loss = running_loss / len(dataloader)
+        avg_mse = running_mse / len(dataloader)
+        avg_cosine = running_cosine / len(dataloader)
+        avg_sigreg = running_sigreg / len(dataloader)
+        epoch_seconds = time.time() - epoch_start_time
         print(f"Epoch {epoch} Complete — Avg Loss: {avg_loss:.4f}")
         if lambda_sigreg > 0.0:
             print(
                 "  Components — "
-                f"mse={running_mse / len(dataloader):.4f}  "
-                f"cos={running_cosine / len(dataloader):.4f}  "
-                f"sigreg={running_sigreg / len(dataloader):.4f}"
+                f"mse={avg_mse:.4f}  "
+                f"cos={avg_cosine:.4f}  "
+                f"sigreg={avg_sigreg:.4f}"
             )
+        append_training_log(
+            checkpoint_dir,
+            {
+                "epoch": epoch,
+                "avg_loss": round(avg_loss, 8),
+                "avg_mse": round(avg_mse, 8),
+                "avg_cosine": round(avg_cosine, 8),
+                "avg_sigreg": round(avg_sigreg, 8),
+                "lambda_sigreg": lambda_sigreg,
+                "lr": epoch_lr,
+                "epoch_seconds": round(epoch_seconds, 3),
+            },
+        )
 
         if epoch % checkpoint_every == 0:
             print(f"  Saving checkpoint at epoch {epoch} ...")
@@ -982,72 +1209,103 @@ def live_distillation(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image-dir", default="/workspace/Datasets_VIT")
-    parser.add_argument("--weights", default="/workspace/Pretrained_Dino_based_MVIT_Distillation/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--checkpoint-every", type=int, default=1)
-    parser.add_argument("--checkpoint-dir", default="checkpoints")
-    parser.add_argument("--resume-from", default="",
+    parser.add_argument("--config", default="",
+                        help="YAML file containing all live distillation training parameters.")
+    parser.add_argument("--image-dir", default=None)
+    parser.add_argument("--weights", default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--checkpoint-every", type=int, default=None)
+    parser.add_argument("--checkpoint-dir", default=None)
+    parser.add_argument("--resume-from", default=None,
                         help="'auto', a checkpoint path, or empty string for fresh training.")
-    parser.add_argument("--init-from", default="",
+    parser.add_argument("--init-from", default=None,
                         help="Warm-start student weights only; resets optimiser, scheduler, scaler, and epoch.")
-    parser.add_argument("--dinov3-repo", default="/workspace/dinov3",
+    parser.add_argument("--dinov3-repo", default=None,
                         help="Local facebookresearch/dinov3 repository path used by torch.hub.load.")
-    parser.add_argument("--image-size", type=int, default=448,
+    parser.add_argument("--image-size", type=int, default=None,
                         help="Square crop size. Must be divisible by 16. Use 512 for 32x32 features.")
-    parser.add_argument("--input-mode", choices=["rgb", "sonar_features", "fls_grayscale", "fls_features"], default="rgb",
+    parser.add_argument("--input-mode", choices=["rgb", "sonar_features", "fls_grayscale", "fls_features"], default=None,
                         help="rgb keeps the camera pipeline; sonar_features uses engineered bounded-mosaic channels; fls_grayscale uses one-channel FLS sonar; fls_features uses engineered FLS channels.")
-    parser.add_argument("--student-mean", default="",
+    parser.add_argument("--student-mean", default=None,
                         help="Comma-separated student channel mean. Defaults to BeeX RGB or sonar-feature stats by input mode.")
-    parser.add_argument("--student-std", default="",
+    parser.add_argument("--student-std", default=None,
                         help="Comma-separated student channel std. Defaults to BeeX RGB or sonar-feature stats by input mode.")
     parser.add_argument("--sonar-middle-channel",
                         choices=["clahe", "occupancy", "inverse_occupancy", "wavelet_low", "wavelet_high", "local_contrast"],
-                        default="wavelet_low")
+                        default=None)
     parser.add_argument("--sonar-third-channel",
                         choices=["sobel_edge", "local_contrast", "raw_robust"],
-                        default="sobel_edge")
-    parser.add_argument("--sonar-wavelet", default="haar")
-    parser.add_argument("--sonar-occupancy-threshold", type=int, default=128)
-    parser.add_argument("--sonar-local-contrast-blur", type=int, default=31)
-    parser.add_argument("--sonar-edge-blur", type=int, default=3)
-    parser.add_argument("--lambda-sigreg", type=float, default=0.0,
+                        default=None)
+    parser.add_argument("--sonar-wavelet", default=None)
+    parser.add_argument("--sonar-occupancy-threshold", type=int, default=None)
+    parser.add_argument("--sonar-local-contrast-blur", type=int, default=None)
+    parser.add_argument("--sonar-edge-blur", type=int, default=None)
+    parser.add_argument("--lambda-sigreg", type=float, default=None,
                         help="Weight for sampled patch SIGReg/uniformity auxiliary loss. 0 disables it.")
-    parser.add_argument("--sigreg-max-tokens", type=int, default=2048,
+    parser.add_argument("--sigreg-max-tokens", type=int, default=None,
                         help="Maximum sampled student patch tokens per batch for SIGReg.")
-    parser.add_argument("--sigreg-projections", type=int, default=256,
+    parser.add_argument("--sigreg-projections", type=int, default=None,
                         help="Number of random sliced projections used by SIGReg.")
-    parser.add_argument("--sigreg-warmup-epochs", type=int, default=0,
+    parser.add_argument("--sigreg-warmup-epochs", type=int, default=None,
                         help="Initial epochs trained with distillation only before enabling SIGReg.")
     args = parser.parse_args()
-    student_mean = parse_triplet(args.student_mean, "--student-mean") if args.student_mean else None
-    student_std = parse_triplet(args.student_std, "--student-std") if args.student_std else None
+
+    yaml_config = load_yaml_run_config(args.config)
+    metadata_keys = {"run_name", "description", "notes"}
+    unknown_keys = sorted(
+        key for key in yaml_config
+        if key not in DEFAULT_RUN_CONFIG and key not in metadata_keys
+    )
+    if unknown_keys:
+        raise ValueError(f"Unknown config key(s): {unknown_keys}")
+
+    run_metadata = {
+        key: yaml_config.pop(key)
+        for key in list(yaml_config.keys())
+        if key in metadata_keys
+    }
+    run_config = dict(DEFAULT_RUN_CONFIG)
+    run_config.update(yaml_config)
+
+    for key in DEFAULT_RUN_CONFIG:
+        value = getattr(args, key, None)
+        if value is not None:
+            run_config[key] = value
+    if run_metadata:
+        run_config["_metadata"] = run_metadata
+
+    student_mean = parse_triplet(run_config.get("student_mean"), "--student-mean")
+    student_std = parse_triplet(run_config.get("student_std"), "--student-std")
+    run_config["student_mean"] = student_mean
+    run_config["student_std"] = student_std
 
     live_distillation(
-        args.image_dir,
-        args.weights,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        checkpoint_every=args.checkpoint_every,
-        checkpoint_dir=args.checkpoint_dir,
-        resume_from=args.resume_from,
-        init_from=args.init_from,
-        dinov3_repo=args.dinov3_repo,
-        image_size=args.image_size,
-        input_mode=args.input_mode,
+        run_config["image_dir"],
+        run_config["weights"],
+        epochs=run_config["epochs"],
+        batch_size=run_config["batch_size"],
+        lr=run_config["lr"],
+        checkpoint_every=run_config["checkpoint_every"],
+        checkpoint_dir=run_config["checkpoint_dir"],
+        resume_from=run_config["resume_from"],
+        init_from=run_config["init_from"],
+        dinov3_repo=run_config["dinov3_repo"],
+        image_size=run_config["image_size"],
+        input_mode=run_config["input_mode"],
         student_mean=student_mean,
         student_std=student_std,
-        sonar_middle_channel=args.sonar_middle_channel,
-        sonar_third_channel=args.sonar_third_channel,
-        sonar_wavelet=args.sonar_wavelet,
-        sonar_occupancy_threshold=args.sonar_occupancy_threshold,
-        sonar_local_contrast_blur=args.sonar_local_contrast_blur,
-        sonar_edge_blur=args.sonar_edge_blur,
-        lambda_sigreg=args.lambda_sigreg,
-        sigreg_max_tokens=args.sigreg_max_tokens,
-        sigreg_projections=args.sigreg_projections,
-        sigreg_warmup_epochs=args.sigreg_warmup_epochs,
+        sonar_middle_channel=run_config["sonar_middle_channel"],
+        sonar_third_channel=run_config["sonar_third_channel"],
+        sonar_wavelet=run_config["sonar_wavelet"],
+        sonar_occupancy_threshold=run_config["sonar_occupancy_threshold"],
+        sonar_local_contrast_blur=run_config["sonar_local_contrast_blur"],
+        sonar_edge_blur=run_config["sonar_edge_blur"],
+        lambda_sigreg=run_config["lambda_sigreg"],
+        sigreg_max_tokens=run_config["sigreg_max_tokens"],
+        sigreg_projections=run_config["sigreg_projections"],
+        sigreg_warmup_epochs=run_config["sigreg_warmup_epochs"],
+        config_path=args.config,
+        run_config=run_config,
     )

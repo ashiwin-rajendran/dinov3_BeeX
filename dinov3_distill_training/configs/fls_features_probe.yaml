@@ -1,0 +1,36 @@
+run_name: fls_features_probe
+description: FLS three-channel feature distillation using raw_robust, inverse_occupancy, local_contrast.
+
+paths:
+  image_dir: /path/to/fls_images
+  weights: /path/to/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth
+  dinov3_repo: /path/to/dinov3
+  checkpoint_dir: checkpoints_fls_features_probe
+  init_from: ""
+  resume_from: ""
+
+training:
+  image_size: 512
+  batch_size: 64
+  epochs: 3
+  lr: 0.001
+  checkpoint_every: 1
+
+input:
+  input_mode: fls_features
+  student_mean: [0.244714, 0.655271, 0.182097]
+  student_std: [0.239831, 0.379848, 0.214078]
+
+sonar:
+  sonar_middle_channel: inverse_occupancy
+  sonar_third_channel: local_contrast
+  sonar_occupancy_threshold: 40
+  sonar_wavelet: haar
+  sonar_local_contrast_blur: 31
+  sonar_edge_blur: 3
+
+sigreg:
+  lambda_sigreg: 0.0
+  sigreg_max_tokens: 2048
+  sigreg_projections: 256
+  sigreg_warmup_epochs: 0

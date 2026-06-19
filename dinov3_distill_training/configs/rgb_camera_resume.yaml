@@ -1,0 +1,28 @@
+run_name: rgb_camera_resume
+description: Continue RGB camera MobileViT distillation from the latest checkpoint in checkpoint_dir.
+
+paths:
+  image_dir: /workspace/Datasets_VIT
+  weights: /workspace/Pretrained_Dino_based_MVIT_Distillation/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth
+  dinov3_repo: /workspace/dinov3
+  checkpoint_dir: checkpoints
+  init_from: ""
+  resume_from: auto
+
+training:
+  image_size: 512
+  batch_size: 145
+  epochs: 50
+  lr: 0.001
+  checkpoint_every: 1
+
+input:
+  input_mode: rgb
+  student_mean:
+  student_std:
+
+sigreg:
+  lambda_sigreg: 0.0
+  sigreg_max_tokens: 2048
+  sigreg_projections: 256
+  sigreg_warmup_epochs: 0

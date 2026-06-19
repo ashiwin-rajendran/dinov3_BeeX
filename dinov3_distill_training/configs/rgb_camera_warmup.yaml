@@ -1,0 +1,28 @@
+run_name: rgb_camera_warmup
+description: RGB camera MobileViT distillation warm-up from an existing student checkpoint.
+
+paths:
+  image_dir: /workspace/Datasets_VIT
+  weights: /workspace/Pretrained_Dino_based_MVIT_Distillation/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth
+  dinov3_repo: /workspace/dinov3
+  checkpoint_dir: checkpoints_rgb_camera_warmup
+  init_from: checkpoints/student_mobilevit_2M_Dinov3_based_epoch0005.pth
+  resume_from: ""
+
+training:
+  image_size: 512
+  batch_size: 145
+  epochs: 50
+  lr: 0.001
+  checkpoint_every: 1
+
+input:
+  input_mode: rgb
+  student_mean:
+  student_std:
+
+sigreg:
+  lambda_sigreg: 0.0
+  sigreg_max_tokens: 2048
+  sigreg_projections: 256
+  sigreg_warmup_epochs: 0
