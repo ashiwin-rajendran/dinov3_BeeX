@@ -297,6 +297,43 @@ def cosine_loss_sum_features(student: torch.Tensor, teacher: torch.Tensor) -> to
     return (1.0 - cos_sim).mean()
 
 
+def sampled_patch_sigreg_loss(
+    student_grid: torch.Tensor,
+    max_tokens: int = 2048,
+    projections: int = 256,
+) -> torch.Tensor:
+    """
+    Lightweight SIGReg-style uniformity term over sampled patch embeddings.
+
+    forward_distill() returns unit vectors, so the reference is a uniform
+    unit-sphere sample rather than an unconstrained Gaussian. The loss is a
+    sliced-Wasserstein proxy: project both sets onto random directions, sort
+    each projection, and match their 1D distributions.
+    """
+    tokens = student_grid.reshape(-1, student_grid.shape[-1]).float()
+    if tokens.shape[0] < 2:
+        return tokens.new_zeros(())
+
+    max_tokens = int(max_tokens)
+    if max_tokens > 0 and tokens.shape[0] > max_tokens:
+        idx = torch.randperm(tokens.shape[0], device=tokens.device)[:max_tokens]
+        tokens = tokens.index_select(0, idx)
+
+    tokens = F.normalize(tokens, p=2, dim=-1)
+    feature_dim = tokens.shape[-1]
+    projections = max(int(projections), 1)
+
+    reference = torch.randn_like(tokens)
+    reference = F.normalize(reference, p=2, dim=-1)
+
+    basis = torch.randn(feature_dim, projections, device=tokens.device, dtype=tokens.dtype)
+    basis = F.normalize(basis, p=2, dim=0)
+
+    projected_tokens = torch.sort(tokens @ basis, dim=0).values
+    projected_reference = torch.sort(reference @ basis, dim=0).values
+    return (projected_tokens - projected_reference).square().mean() * feature_dim
+
+
 # ---------------------------------------------------------------------------
 # 3.  TorchScript checkpoint helper
 # ---------------------------------------------------------------------------
@@ -318,6 +355,10 @@ def save_torchscript_checkpoint(
     sonar_occupancy_threshold: int = 128,
     sonar_local_contrast_blur: int = 31,
     sonar_edge_blur: int = 3,
+    lambda_sigreg: float = 0.0,
+    sigreg_max_tokens: int = 2048,
+    sigreg_projections: int = 256,
+    sigreg_warmup_epochs: int = 0,
     optimizer=None,
     scheduler=None,
     scaler=None,
@@ -402,6 +443,12 @@ def save_torchscript_checkpoint(
             "occupancy_threshold": int(sonar_occupancy_threshold),
             "local_contrast_blur": int(sonar_local_contrast_blur),
             "edge_blur": int(sonar_edge_blur),
+        },
+        "auxiliary_loss_config": {
+            "lambda_sigreg": float(lambda_sigreg),
+            "sigreg_max_tokens": int(sigreg_max_tokens),
+            "sigreg_projections": int(sigreg_projections),
+            "sigreg_warmup_epochs": int(sigreg_warmup_epochs),
         },
     }
     if optimizer is not None:
@@ -540,18 +587,34 @@ def live_distillation(
     sonar_occupancy_threshold: int = 128,
     sonar_local_contrast_blur: int = 31,
     sonar_edge_blur: int = 3,
+    lambda_sigreg: float = 0.0,
+    sigreg_max_tokens: int = 2048,
+    sigreg_projections: int = 256,
+    sigreg_warmup_epochs: int = 0,
 ) -> None:
 
     image_size = int(image_size)
     epochs = int(epochs)
     batch_size = int(batch_size)
     checkpoint_every = int(checkpoint_every)
+    lambda_sigreg = float(lambda_sigreg)
+    sigreg_max_tokens = int(sigreg_max_tokens)
+    sigreg_projections = int(sigreg_projections)
+    sigreg_warmup_epochs = int(sigreg_warmup_epochs)
     if epochs < 1:
         raise ValueError(f"epochs must be >= 1, got {epochs}")
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
     if checkpoint_every < 1:
         raise ValueError(f"checkpoint_every must be >= 1, got {checkpoint_every}")
+    if lambda_sigreg < 0:
+        raise ValueError(f"lambda_sigreg must be >= 0, got {lambda_sigreg}")
+    if sigreg_max_tokens < 2:
+        raise ValueError(f"sigreg_max_tokens must be >= 2, got {sigreg_max_tokens}")
+    if sigreg_projections < 1:
+        raise ValueError(f"sigreg_projections must be >= 1, got {sigreg_projections}")
+    if sigreg_warmup_epochs < 0:
+        raise ValueError(f"sigreg_warmup_epochs must be >= 0, got {sigreg_warmup_epochs}")
     if image_size % 16 != 0:
         raise ValueError(f"image_size must be divisible by 16 for DINOv3 ViT-L/16, got {image_size}")
     if not Path(image_dir).is_dir():
@@ -607,6 +670,12 @@ def live_distillation(
         print("  Student norm: uint8/127.5 - 1.0")
     else:
         print(f"  Student norm mean={student_mean} std={student_std}")
+    if lambda_sigreg > 0.0:
+        print(
+            f"  Aux SIGReg: ENABLED  "
+            f"(lambda={lambda_sigreg:g}, max_tokens={sigreg_max_tokens}, "
+            f"projections={sigreg_projections}, warmup_epochs={sigreg_warmup_epochs})"
+        )
 
     # ------------------------------------------------------------------ #
     # A.  Frozen Teacher — DINOv3 ViT-Large/16                            #
@@ -715,6 +784,9 @@ def live_distillation(
     for epoch in range(start_epoch, epochs + 1):
         student.train()
         running_loss = 0.0
+        running_mse = 0.0
+        running_cosine = 0.0
+        running_sigreg = 0.0
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
         for batch in pbar:
@@ -796,22 +868,49 @@ def live_distillation(
                 # Both losses are bounded and batch-size-independent.
                 mse_loss    = mse_loss_sum_features(student_grid, teacher_grid)
                 cosine_loss = cosine_loss_sum_features(student_grid, teacher_grid)
-                total_loss  = mse_loss + cosine_loss
+                distill_loss = mse_loss + cosine_loss
+
+                sigreg_loss = student_grid.new_zeros(())
+                effective_lambda_sigreg = 0.0
+                if lambda_sigreg > 0.0 and epoch > sigreg_warmup_epochs:
+                    with torch.amp.autocast(device_type=device.type, enabled=False):
+                        sigreg_loss = sampled_patch_sigreg_loss(
+                            student_grid,
+                            max_tokens=sigreg_max_tokens,
+                            projections=sigreg_projections,
+                        )
+                    effective_lambda_sigreg = lambda_sigreg
+
+                total_loss = distill_loss + effective_lambda_sigreg * sigreg_loss
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             running_loss += total_loss.item()
-            pbar.set_postfix({
+            running_mse += mse_loss.item()
+            running_cosine += cosine_loss.item()
+            running_sigreg += sigreg_loss.item()
+            postfix = {
                 "loss": f"{total_loss.item():.4f}",
                 "mse":  f"{mse_loss.item():.4f}",
                 "cos":  f"{cosine_loss.item():.4f}",
-            })
+            }
+            if lambda_sigreg > 0.0:
+                postfix["sig"] = f"{sigreg_loss.item():.4f}"
+                postfix["sigλ"] = f"{effective_lambda_sigreg:g}"
+            pbar.set_postfix(postfix)
 
         scheduler.step()
         avg_loss = running_loss / len(dataloader)
         print(f"Epoch {epoch} Complete — Avg Loss: {avg_loss:.4f}")
+        if lambda_sigreg > 0.0:
+            print(
+                "  Components — "
+                f"mse={running_mse / len(dataloader):.4f}  "
+                f"cos={running_cosine / len(dataloader):.4f}  "
+                f"sigreg={running_sigreg / len(dataloader):.4f}"
+            )
 
         if epoch % checkpoint_every == 0:
             print(f"  Saving checkpoint at epoch {epoch} ...")
@@ -833,6 +932,10 @@ def live_distillation(
                 sonar_occupancy_threshold=sonar_occupancy_threshold,
                 sonar_local_contrast_blur=sonar_local_contrast_blur,
                 sonar_edge_blur=sonar_edge_blur,
+                lambda_sigreg=lambda_sigreg,
+                sigreg_max_tokens=sigreg_max_tokens,
+                sigreg_projections=sigreg_projections,
+                sigreg_warmup_epochs=sigreg_warmup_epochs,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 scaler=scaler,
@@ -859,6 +962,10 @@ def live_distillation(
         sonar_occupancy_threshold=sonar_occupancy_threshold,
         sonar_local_contrast_blur=sonar_local_contrast_blur,
         sonar_edge_blur=sonar_edge_blur,
+        lambda_sigreg=lambda_sigreg,
+        sigreg_max_tokens=sigreg_max_tokens,
+        sigreg_projections=sigreg_projections,
+        sigreg_warmup_epochs=sigreg_warmup_epochs,
         optimizer=optimizer,
         scheduler=scheduler,
         scaler=scaler,
@@ -906,6 +1013,14 @@ if __name__ == "__main__":
     parser.add_argument("--sonar-occupancy-threshold", type=int, default=128)
     parser.add_argument("--sonar-local-contrast-blur", type=int, default=31)
     parser.add_argument("--sonar-edge-blur", type=int, default=3)
+    parser.add_argument("--lambda-sigreg", type=float, default=0.0,
+                        help="Weight for sampled patch SIGReg/uniformity auxiliary loss. 0 disables it.")
+    parser.add_argument("--sigreg-max-tokens", type=int, default=2048,
+                        help="Maximum sampled student patch tokens per batch for SIGReg.")
+    parser.add_argument("--sigreg-projections", type=int, default=256,
+                        help="Number of random sliced projections used by SIGReg.")
+    parser.add_argument("--sigreg-warmup-epochs", type=int, default=0,
+                        help="Initial epochs trained with distillation only before enabling SIGReg.")
     args = parser.parse_args()
     student_mean = parse_triplet(args.student_mean, "--student-mean") if args.student_mean else None
     student_std = parse_triplet(args.student_std, "--student-std") if args.student_std else None
@@ -931,4 +1046,8 @@ if __name__ == "__main__":
         sonar_occupancy_threshold=args.sonar_occupancy_threshold,
         sonar_local_contrast_blur=args.sonar_local_contrast_blur,
         sonar_edge_blur=args.sonar_edge_blur,
+        lambda_sigreg=args.lambda_sigreg,
+        sigreg_max_tokens=args.sigreg_max_tokens,
+        sigreg_projections=args.sigreg_projections,
+        sigreg_warmup_epochs=args.sigreg_warmup_epochs,
     )
