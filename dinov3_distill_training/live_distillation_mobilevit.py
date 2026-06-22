@@ -32,6 +32,7 @@ from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
 import argparse
+import csv
 import json
 import math
 import numpy as np
@@ -44,6 +45,11 @@ try:
     import yaml
 except ImportError:
     yaml = None
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 VIT_SCRIPTS_DIR = Path(os.environ.get(
     "VIT_SCRIPTS_DIR",
@@ -89,6 +95,10 @@ DEFAULT_RUN_CONFIG = {
     "sonar_occupancy_threshold": 128,
     "sonar_local_contrast_blur": 31,
     "sonar_edge_blur": 3,
+    "sonar_mask_mode": "support_hull",
+    "sonar_mask_threshold": 3,
+    "sonar_mask_close_kernel": 21,
+    "sonar_mask_min_coverage": 0.05,
     "lambda_sigreg": 0.0,
     "sigreg_max_tokens": 2048,
     "sigreg_projections": 256,
@@ -255,15 +265,33 @@ def append_training_log(checkpoint_dir: str, record: dict) -> None:
         "avg_mse",
         "avg_cosine",
         "avg_sigreg",
+        "avg_valid_patch_fraction",
         "lambda_sigreg",
         "lr",
         "epoch_seconds",
     ]
+    if csv_path.exists():
+        with csv_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            existing_columns = reader.fieldnames or []
+            existing_rows = list(reader)
+        if existing_columns != csv_columns:
+            migration_path = csv_path.with_suffix(".csv.tmp")
+            with migration_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=csv_columns)
+                writer.writeheader()
+                writer.writerows(
+                    {column: row.get(column, "") for column in csv_columns}
+                    for row in existing_rows
+                )
+            migration_path.replace(csv_path)
+
     write_header = not csv_path.exists()
-    with csv_path.open("a", encoding="utf-8") as handle:
+    with csv_path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=csv_columns)
         if write_header:
-            handle.write(",".join(csv_columns) + "\n")
-        handle.write(",".join(str(record.get(column, "")) for column in csv_columns) + "\n")
+            writer.writeheader()
+        writer.writerow({column: record.get(column, "") for column in csv_columns})
 
 
 def preprocessing_contract(
@@ -301,6 +329,64 @@ def preprocessing_contract(
     )
 
 
+def spatial_mask_contract(
+    input_mode: str,
+    mask_mode: str,
+    threshold: int,
+    close_kernel: int,
+    min_coverage: float,
+) -> str:
+    if input_mode == "rgb" or mask_mode == "none":
+        return "all_grid_cells_v1"
+    return (
+        f"sonar_support_mask_v1__mode_{mask_mode}"
+        f"__threshold_{int(threshold)}"
+        f"__close_{int(close_kernel)}"
+        f"__coverage_{float(min_coverage):.4f}"
+    )
+
+
+def make_sonar_support_mask(gray: np.ndarray, threshold: int, close_kernel: int) -> np.ndarray:
+    """Recover the sonar support while retaining dark shadows inside it."""
+    seed = (gray > int(threshold)).astype(np.uint8)
+    if seed.sum() < 16:
+        return seed.astype(bool)
+
+    if cv2 is not None:
+        opened = cv2.morphologyEx(
+            seed,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        )
+        kernel = max(int(close_kernel), 3)
+        if kernel % 2 == 0:
+            kernel += 1
+        closed = cv2.morphologyEx(
+            opened,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel, kernel)),
+        )
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+        if count <= 1:
+            return closed.astype(bool)
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        component = (labels == largest).astype(np.uint8)
+        ys, xs = np.where(component > 0)
+        if len(xs) < 3:
+            return component.astype(bool)
+        hull = cv2.convexHull(np.column_stack([xs, ys]).astype(np.int32))
+        support = np.zeros_like(component)
+        cv2.fillConvexPoly(support, hull, 1)
+        return support.astype(bool)
+
+    support = np.zeros_like(seed, dtype=bool)
+    for row in range(seed.shape[0]):
+        columns = np.flatnonzero(seed[row])
+        if columns.size:
+            support[row, columns[0]:columns[-1] + 1] = True
+    return support
+
+
 class LiveAugmentationDataset(Dataset):
     def __init__(
         self,
@@ -313,6 +399,9 @@ class LiveAugmentationDataset(Dataset):
         sonar_occupancy_threshold: int = 128,
         sonar_local_contrast_blur: int = 31,
         sonar_edge_blur: int = 3,
+        sonar_mask_mode: str = "support_hull",
+        sonar_mask_threshold: int = 3,
+        sonar_mask_close_kernel: int = 21,
     ):
         self.directory = Path(image_dir)
         self.image_size = int(image_size)
@@ -323,6 +412,9 @@ class LiveAugmentationDataset(Dataset):
         self.sonar_occupancy_threshold = int(sonar_occupancy_threshold)
         self.sonar_local_contrast_blur = int(sonar_local_contrast_blur)
         self.sonar_edge_blur = int(sonar_edge_blur)
+        self.sonar_mask_mode = sonar_mask_mode
+        self.sonar_mask_threshold = int(sonar_mask_threshold)
+        self.sonar_mask_close_kernel = int(sonar_mask_close_kernel)
         self.image_paths = [
             p for p in self.directory.rglob("*")
             if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
@@ -351,7 +443,8 @@ class LiveAugmentationDataset(Dataset):
             )
             teacher_image = TF.to_tensor(gray.convert("RGB"))
             student_image = TF.to_tensor(gray).mul(2.0).sub(1.0)
-            return teacher_image, student_image
+            support = self._support_tensor(np.asarray(gray, dtype=np.uint8))
+            return teacher_image, student_image, support
         if self.input_mode == "fls_features":
             gray = self._center_square(image.convert("L"))
             gray = TF.resize(
@@ -371,7 +464,8 @@ class LiveAugmentationDataset(Dataset):
                 third_channel=self.sonar_third_channel,
             )
             student_image = torch.from_numpy(student_features).permute(2, 0, 1).float()
-            return teacher_image, student_image
+            support = self._support_tensor(gray_np)
+            return teacher_image, student_image, support
         if self.input_mode != "sonar_features":
             raise ValueError(f"Unsupported input_mode: {self.input_mode}")
 
@@ -402,7 +496,21 @@ class LiveAugmentationDataset(Dataset):
             third_channel=self.sonar_third_channel,
         )
         student_image = torch.from_numpy(student_features).permute(2, 0, 1).float()
-        return teacher_image, student_image
+        support = self._support_tensor(gray_np)
+        return teacher_image, student_image, support
+
+    def _support_tensor(self, gray: np.ndarray) -> torch.Tensor:
+        if self.sonar_mask_mode == "none":
+            support = np.ones(gray.shape, dtype=bool)
+        elif self.sonar_mask_mode == "support_hull":
+            support = make_sonar_support_mask(
+                gray,
+                threshold=self.sonar_mask_threshold,
+                close_kernel=self.sonar_mask_close_kernel,
+            )
+        else:
+            raise ValueError(f"Unsupported sonar_mask_mode: {self.sonar_mask_mode}")
+        return torch.from_numpy(support)
 
     @staticmethod
     def _center_square(image: Image.Image) -> Image.Image:
@@ -427,7 +535,25 @@ class DistillExportWrapper(nn.Module):
 # 2.  Normalised-sum distillation losses (unchanged from original design)
 # ---------------------------------------------------------------------------
 
-def mse_loss_sum_features(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
+def masked_patch_mean(values: torch.Tensor, valid_mask: torch.Tensor = None) -> torch.Tensor:
+    if valid_mask is None:
+        return values.mean()
+    if values.shape != valid_mask.shape:
+        raise ValueError(
+            f"Patch values shape {tuple(values.shape)} does not match mask {tuple(valid_mask.shape)}"
+        )
+    valid_mask = valid_mask.to(device=values.device, dtype=values.dtype)
+    denominator = valid_mask.sum()
+    if denominator.item() < 1:
+        raise ValueError("Spatial mask removed every patch in the batch")
+    return (values * valid_mask).sum() / denominator
+
+
+def mse_loss_sum_features(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    valid_mask: torch.Tensor = None,
+) -> torch.Tensor:
     """
     Sum squared error over the C=1024 feature dimension,
     then mean over batch × spatial positions (B × G × G).
@@ -438,10 +564,15 @@ def mse_loss_sum_features(student: torch.Tensor, teacher: torch.Tensor) -> torch
     Every patch token contributes its total feature reconstruction error —
     no dilution across 1024 dims — while the gradient stays batch-size stable.
     """
-    return ((student - teacher) ** 2).sum(dim=-1).mean()
+    per_patch = ((student - teacher) ** 2).sum(dim=-1)
+    return masked_patch_mean(per_patch, valid_mask)
 
 
-def cosine_loss_sum_features(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
+def cosine_loss_sum_features(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    valid_mask: torch.Tensor = None,
+) -> torch.Tensor:
     """
     (1 − cosine_similarity) over the C=1024 feature dimension,
     then mean over B × G × G.
@@ -455,13 +586,14 @@ def cosine_loss_sum_features(student: torch.Tensor, teacher: torch.Tensor) -> to
     Penalises directional misalignment orthogonally to MSE's magnitude signal.
     """
     cos_sim = F.cosine_similarity(student, teacher, dim=-1)  # [B, G, G]
-    return (1.0 - cos_sim).mean()
+    return masked_patch_mean(1.0 - cos_sim, valid_mask)
 
 
 def sampled_patch_sigreg_loss(
     student_grid: torch.Tensor,
     max_tokens: int = 2048,
     projections: int = 256,
+    valid_mask: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Lightweight SIGReg-style uniformity term over sampled patch embeddings.
@@ -471,7 +603,15 @@ def sampled_patch_sigreg_loss(
     sliced-Wasserstein proxy: project both sets onto random directions, sort
     each projection, and match their 1D distributions.
     """
-    tokens = student_grid.reshape(-1, student_grid.shape[-1]).float()
+    if valid_mask is None:
+        tokens = student_grid.reshape(-1, student_grid.shape[-1]).float()
+    else:
+        if student_grid.shape[:-1] != valid_mask.shape:
+            raise ValueError(
+                f"Student grid shape {tuple(student_grid.shape[:-1])} does not "
+                f"match mask {tuple(valid_mask.shape)}"
+            )
+        tokens = student_grid[valid_mask.to(student_grid.device)].float()
     if tokens.shape[0] < 2:
         return tokens.new_zeros(())
 
@@ -516,6 +656,11 @@ def save_torchscript_checkpoint(
     sonar_occupancy_threshold: int = 128,
     sonar_local_contrast_blur: int = 31,
     sonar_edge_blur: int = 3,
+    sonar_mask_mode: str = "support_hull",
+    sonar_mask_threshold: int = 3,
+    sonar_mask_close_kernel: int = 21,
+    sonar_mask_min_coverage: float = 0.05,
+    avg_valid_patch_fraction: float = 1.0,
     lambda_sigreg: float = 0.0,
     sigreg_max_tokens: int = 2048,
     sigreg_projections: int = 256,
@@ -595,6 +740,20 @@ def save_torchscript_checkpoint(
         "inference_note": "forward_distill supports any square input divisible by 16",
         "input_mode": input_mode,
         "preprocessing_contract": preprocessing_contract,
+        "spatial_mask_contract": spatial_mask_contract(
+            input_mode,
+            sonar_mask_mode,
+            sonar_mask_threshold,
+            sonar_mask_close_kernel,
+            sonar_mask_min_coverage,
+        ),
+        "spatial_mask_config": {
+            "mode": sonar_mask_mode if input_mode != "rgb" else "none",
+            "threshold": int(sonar_mask_threshold),
+            "close_kernel": int(sonar_mask_close_kernel),
+            "min_grid_coverage": float(sonar_mask_min_coverage),
+            "avg_valid_patch_fraction": float(avg_valid_patch_fraction),
+        },
         "teacher_normalization": {"mean": TEACHER_MEAN, "std": TEACHER_STD},
         "student_normalization": student_normalization,
         "sonar_feature_config": {
@@ -649,6 +808,7 @@ def load_distill_checkpoint(
     device="cpu",
     expected_image_size: int = None,
     expected_preprocessing_contract: str = RGB_PREPROCESSING_CONTRACT,
+    expected_spatial_mask_contract: str = "all_grid_cells_v1",
 ) -> tuple:
     """
     Resume a tagged checkpoint created with the current preprocessing contract.
@@ -667,6 +827,17 @@ def load_distill_checkpoint(
                 "[Resume] Checkpoint preprocessing contract is missing or incompatible. "
                 "Use --init-from to reuse its student weights with a fresh optimiser "
                 "and scheduler."
+            )
+        saved_mask_contract = ckpt.get("spatial_mask_contract")
+        legacy_unmasked = (
+            expected_spatial_mask_contract == "all_grid_cells_v1"
+            and saved_mask_contract in {None, "all_grid_cells_v1"}
+        )
+        if not legacy_unmasked and saved_mask_contract != expected_spatial_mask_contract:
+            raise ValueError(
+                "[Resume] Checkpoint spatial-mask objective is missing or incompatible. "
+                f"Saved={saved_mask_contract!r}, expected={expected_spatial_mask_contract!r}. "
+                "Use --init-from to warm-start the student with a fresh optimiser and scheduler."
             )
         student.load_state_dict(ckpt["model_state_dict"], strict=True)
         saved_img_size = ckpt.get("train_img_size")
@@ -711,15 +882,18 @@ def load_initial_student_weights(
         state_dict = ckpt["model_state_dict"]
         source_epoch = ckpt.get("epoch", "?")
         source_contract = ckpt.get("preprocessing_contract", "legacy-or-unknown")
+        source_mask_contract = ckpt.get("spatial_mask_contract", "legacy-unmasked")
     else:
         state_dict = ckpt
         source_epoch = "?"
         source_contract = "raw-model-state"
+        source_mask_contract = "unknown"
 
     student.load_state_dict(state_dict, strict=True)
     print(f"[Init] Warm-started student weights: {ckpt_path}")
     print(f"       Source epoch: {source_epoch}")
     print(f"       Source preprocessing contract: {source_contract}")
+    print(f"       Source spatial-mask contract: {source_mask_contract}")
     print("       Fresh optimiser, scheduler, scaler, and epoch counter will be used.")
 
 
@@ -748,6 +922,10 @@ def live_distillation(
     sonar_occupancy_threshold: int = 128,
     sonar_local_contrast_blur: int = 31,
     sonar_edge_blur: int = 3,
+    sonar_mask_mode: str = "support_hull",
+    sonar_mask_threshold: int = 3,
+    sonar_mask_close_kernel: int = 21,
+    sonar_mask_min_coverage: float = 0.05,
     lambda_sigreg: float = 0.0,
     sigreg_max_tokens: int = 2048,
     sigreg_projections: int = 256,
@@ -764,6 +942,9 @@ def live_distillation(
     sigreg_max_tokens = int(sigreg_max_tokens)
     sigreg_projections = int(sigreg_projections)
     sigreg_warmup_epochs = int(sigreg_warmup_epochs)
+    sonar_mask_threshold = int(sonar_mask_threshold)
+    sonar_mask_close_kernel = int(sonar_mask_close_kernel)
+    sonar_mask_min_coverage = float(sonar_mask_min_coverage)
     if epochs < 1:
         raise ValueError(f"epochs must be >= 1, got {epochs}")
     if batch_size < 1:
@@ -778,6 +959,14 @@ def live_distillation(
         raise ValueError(f"sigreg_projections must be >= 1, got {sigreg_projections}")
     if sigreg_warmup_epochs < 0:
         raise ValueError(f"sigreg_warmup_epochs must be >= 0, got {sigreg_warmup_epochs}")
+    if sonar_mask_mode not in {"none", "support_hull"}:
+        raise ValueError("sonar_mask_mode must be 'none' or 'support_hull'")
+    if sonar_mask_threshold < 0 or sonar_mask_threshold > 255:
+        raise ValueError("sonar_mask_threshold must be in [0, 255]")
+    if sonar_mask_close_kernel < 1:
+        raise ValueError("sonar_mask_close_kernel must be >= 1")
+    if not 0.0 < sonar_mask_min_coverage <= 1.0:
+        raise ValueError("sonar_mask_min_coverage must be in (0, 1]")
     if image_size % 16 != 0:
         raise ValueError(f"image_size must be divisible by 16 for DINOv3 ViT-L/16, got {image_size}")
     if not Path(image_dir).is_dir():
@@ -809,6 +998,13 @@ def live_distillation(
         sonar_local_contrast_blur=sonar_local_contrast_blur,
         sonar_edge_blur=sonar_edge_blur,
     )
+    run_mask_contract = spatial_mask_contract(
+        input_mode,
+        sonar_mask_mode,
+        sonar_mask_threshold,
+        sonar_mask_close_kernel,
+        sonar_mask_min_coverage,
+    )
     resolved_run_config = dict(run_config or {})
     resolved_run_config.update({
         "image_dir": image_dir,
@@ -831,6 +1027,10 @@ def live_distillation(
         "sonar_occupancy_threshold": int(sonar_occupancy_threshold),
         "sonar_local_contrast_blur": int(sonar_local_contrast_blur),
         "sonar_edge_blur": int(sonar_edge_blur),
+        "sonar_mask_mode": sonar_mask_mode,
+        "sonar_mask_threshold": sonar_mask_threshold,
+        "sonar_mask_close_kernel": sonar_mask_close_kernel,
+        "sonar_mask_min_coverage": sonar_mask_min_coverage,
         "lambda_sigreg": lambda_sigreg,
         "sigreg_max_tokens": sigreg_max_tokens,
         "sigreg_projections": sigreg_projections,
@@ -865,6 +1065,11 @@ def live_distillation(
             f"  Aux SIGReg: ENABLED  "
             f"(lambda={lambda_sigreg:g}, max_tokens={sigreg_max_tokens}, "
             f"projections={sigreg_projections}, warmup_epochs={sigreg_warmup_epochs})"
+        )
+    if input_mode != "rgb":
+        print(
+            f"  Spatial mask: mode={sonar_mask_mode} threshold={sonar_mask_threshold} "
+            f"close={sonar_mask_close_kernel} min_grid_coverage={sonar_mask_min_coverage:g}"
         )
 
     # ------------------------------------------------------------------ #
@@ -924,6 +1129,9 @@ def live_distillation(
         sonar_occupancy_threshold=sonar_occupancy_threshold,
         sonar_local_contrast_blur=sonar_local_contrast_blur,
         sonar_edge_blur=sonar_edge_blur,
+        sonar_mask_mode=sonar_mask_mode,
+        sonar_mask_threshold=sonar_mask_threshold,
+        sonar_mask_close_kernel=sonar_mask_close_kernel,
     )
     if len(dataset) == 0:
         raise FileNotFoundError(f"No images found under {image_dir}")
@@ -959,6 +1167,7 @@ def live_distillation(
             device=device,
             expected_image_size=image_size,
             expected_preprocessing_contract=run_contract,
+            expected_spatial_mask_contract=run_mask_contract,
         )
     student.to(device)
     resolved_run_config["resume_from"] = resume_from
@@ -974,6 +1183,7 @@ def live_distillation(
             "dataloader_batches": len(dataloader),
             "expected_grid": expected_grid,
             "preprocessing_contract": run_contract,
+            "spatial_mask_contract": run_mask_contract,
             "start_epoch": start_epoch,
             "teacher": "dinov3_vitl16",
             "student": "mobilevit_s_distill",
@@ -997,16 +1207,19 @@ def live_distillation(
         running_mse = 0.0
         running_cosine = 0.0
         running_sigreg = 0.0
+        running_valid_patch_fraction = 0.0
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}")
         for batch in pbar:
             if input_mode in {"sonar_features", "fls_grayscale", "fls_features"}:
-                teacher_input, student_input = batch
+                teacher_input, student_input, pixel_valid_mask = batch
                 teacher_input = teacher_input.to(device)
                 student_input = student_input.to(device)
+                pixel_valid_mask = pixel_valid_mask.to(device)
             else:
                 teacher_input = batch.to(device)
                 student_input = teacher_input
+                pixel_valid_mask = None
 
             teacher_images = TF.normalize(
                 teacher_input,
@@ -1053,6 +1266,31 @@ def live_distillation(
                     )                                                      # [B, H, W, 1024]
                     teacher_grid = F.normalize(teacher_grid, p=2, dim=-1)
 
+                # Convert the image-space sonar support mask into the exact
+                # teacher/student patch grid. A low coverage threshold keeps
+                # boundary patches while rejecting external black padding.
+                if pixel_valid_mask is None:
+                    grid_valid_mask = None
+                    valid_patch_fraction = teacher_grid.new_ones(())
+                else:
+                    patch_coverage = F.interpolate(
+                        pixel_valid_mask[:, None].float(),
+                        size=teacher_grid.shape[1:3],
+                        mode="area",
+                    )[:, 0]
+                    grid_valid_mask = patch_coverage >= sonar_mask_min_coverage
+                    valid_per_sample = grid_valid_mask.flatten(1).sum(dim=1)
+                    if torch.any(valid_per_sample == 0):
+                        bad_indices = torch.nonzero(
+                            valid_per_sample == 0, as_tuple=False
+                        ).flatten().tolist()
+                        raise ValueError(
+                            "Sonar support mask removed every patch for batch "
+                            f"sample(s) {bad_indices}. Lower sonar_mask_min_coverage "
+                            "or inspect the source images."
+                        )
+                    valid_patch_fraction = grid_valid_mask.float().mean()
+
                 # --- Student prediction (with gradients) ---
                 #
                 # MobileViT-S distillation variant:
@@ -1076,8 +1314,12 @@ def live_distillation(
                 #         → directional alignment, complements MSE
                 #
                 # Both losses are bounded and batch-size-independent.
-                mse_loss    = mse_loss_sum_features(student_grid, teacher_grid)
-                cosine_loss = cosine_loss_sum_features(student_grid, teacher_grid)
+                mse_loss = mse_loss_sum_features(
+                    student_grid, teacher_grid, grid_valid_mask
+                )
+                cosine_loss = cosine_loss_sum_features(
+                    student_grid, teacher_grid, grid_valid_mask
+                )
                 distill_loss = mse_loss + cosine_loss
 
                 sigreg_loss = student_grid.new_zeros(())
@@ -1088,6 +1330,7 @@ def live_distillation(
                             student_grid,
                             max_tokens=sigreg_max_tokens,
                             projections=sigreg_projections,
+                            valid_mask=grid_valid_mask,
                         )
                     effective_lambda_sigreg = lambda_sigreg
 
@@ -1101,11 +1344,14 @@ def live_distillation(
             running_mse += mse_loss.item()
             running_cosine += cosine_loss.item()
             running_sigreg += sigreg_loss.item()
+            running_valid_patch_fraction += valid_patch_fraction.item()
             postfix = {
                 "loss": f"{total_loss.item():.4f}",
                 "mse":  f"{mse_loss.item():.4f}",
                 "cos":  f"{cosine_loss.item():.4f}",
             }
+            if pixel_valid_mask is not None:
+                postfix["valid"] = f"{valid_patch_fraction.item() * 100:.1f}%"
             if lambda_sigreg > 0.0:
                 postfix["sig"] = f"{sigreg_loss.item():.4f}"
                 postfix["sigλ"] = f"{effective_lambda_sigreg:g}"
@@ -1116,8 +1362,11 @@ def live_distillation(
         avg_mse = running_mse / len(dataloader)
         avg_cosine = running_cosine / len(dataloader)
         avg_sigreg = running_sigreg / len(dataloader)
+        avg_valid_patch_fraction = running_valid_patch_fraction / len(dataloader)
         epoch_seconds = time.time() - epoch_start_time
         print(f"Epoch {epoch} Complete — Avg Loss: {avg_loss:.4f}")
+        if input_mode != "rgb":
+            print(f"  Valid sonar patches: {avg_valid_patch_fraction * 100:.2f}%")
         if lambda_sigreg > 0.0:
             print(
                 "  Components — "
@@ -1133,6 +1382,7 @@ def live_distillation(
                 "avg_mse": round(avg_mse, 8),
                 "avg_cosine": round(avg_cosine, 8),
                 "avg_sigreg": round(avg_sigreg, 8),
+                "avg_valid_patch_fraction": round(avg_valid_patch_fraction, 8),
                 "lambda_sigreg": lambda_sigreg,
                 "lr": epoch_lr,
                 "epoch_seconds": round(epoch_seconds, 3),
@@ -1159,6 +1409,11 @@ def live_distillation(
                 sonar_occupancy_threshold=sonar_occupancy_threshold,
                 sonar_local_contrast_blur=sonar_local_contrast_blur,
                 sonar_edge_blur=sonar_edge_blur,
+                sonar_mask_mode=sonar_mask_mode,
+                sonar_mask_threshold=sonar_mask_threshold,
+                sonar_mask_close_kernel=sonar_mask_close_kernel,
+                sonar_mask_min_coverage=sonar_mask_min_coverage,
+                avg_valid_patch_fraction=avg_valid_patch_fraction,
                 lambda_sigreg=lambda_sigreg,
                 sigreg_max_tokens=sigreg_max_tokens,
                 sigreg_projections=sigreg_projections,
@@ -1189,6 +1444,11 @@ def live_distillation(
         sonar_occupancy_threshold=sonar_occupancy_threshold,
         sonar_local_contrast_blur=sonar_local_contrast_blur,
         sonar_edge_blur=sonar_edge_blur,
+        sonar_mask_mode=sonar_mask_mode,
+        sonar_mask_threshold=sonar_mask_threshold,
+        sonar_mask_close_kernel=sonar_mask_close_kernel,
+        sonar_mask_min_coverage=sonar_mask_min_coverage,
+        avg_valid_patch_fraction=avg_valid_patch_fraction,
         lambda_sigreg=lambda_sigreg,
         sigreg_max_tokens=sigreg_max_tokens,
         sigreg_projections=sigreg_projections,
@@ -1242,6 +1502,14 @@ if __name__ == "__main__":
     parser.add_argument("--sonar-occupancy-threshold", type=int, default=None)
     parser.add_argument("--sonar-local-contrast-blur", type=int, default=None)
     parser.add_argument("--sonar-edge-blur", type=int, default=None)
+    parser.add_argument("--sonar-mask-mode", choices=["none", "support_hull"], default=None,
+                        help="Exclude external sonar padding from patch losses; use none for legacy behavior.")
+    parser.add_argument("--sonar-mask-threshold", type=int, default=None,
+                        help="Raw grayscale threshold used to seed the sonar support hull.")
+    parser.add_argument("--sonar-mask-close-kernel", type=int, default=None,
+                        help="Morphology kernel used before filling the sonar support hull.")
+    parser.add_argument("--sonar-mask-min-coverage", type=float, default=None,
+                        help="Minimum valid image-area fraction required to retain a grid patch.")
     parser.add_argument("--lambda-sigreg", type=float, default=None,
                         help="Weight for sampled patch SIGReg/uniformity auxiliary loss. 0 disables it.")
     parser.add_argument("--sigreg-max-tokens", type=int, default=None,
@@ -1302,6 +1570,10 @@ if __name__ == "__main__":
         sonar_occupancy_threshold=run_config["sonar_occupancy_threshold"],
         sonar_local_contrast_blur=run_config["sonar_local_contrast_blur"],
         sonar_edge_blur=run_config["sonar_edge_blur"],
+        sonar_mask_mode=run_config["sonar_mask_mode"],
+        sonar_mask_threshold=run_config["sonar_mask_threshold"],
+        sonar_mask_close_kernel=run_config["sonar_mask_close_kernel"],
+        sonar_mask_min_coverage=run_config["sonar_mask_min_coverage"],
         lambda_sigreg=run_config["lambda_sigreg"],
         sigreg_max_tokens=run_config["sigreg_max_tokens"],
         sigreg_projections=run_config["sigreg_projections"],

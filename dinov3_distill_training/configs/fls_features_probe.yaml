@@ -28,6 +28,10 @@ sonar:
   sonar_wavelet: haar
   sonar_local_contrast_blur: 31
   sonar_edge_blur: 3
+  sonar_mask_mode: support_hull
+  sonar_mask_threshold: 3
+  sonar_mask_close_kernel: 21
+  sonar_mask_min_coverage: 0.05
 
 sigreg:
   lambda_sigreg: 0.0

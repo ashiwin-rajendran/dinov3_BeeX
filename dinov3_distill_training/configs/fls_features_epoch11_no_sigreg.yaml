@@ -5,7 +5,7 @@ paths:
   image_dir: /workspace/home/beex-dgx/DATASETS/FLS_UPDATED/
   weights: /workspace/home/beex-dgx/ML_VIT_TRAINING/vit_training/dinov3_BeeX/weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth
   dinov3_repo: /workspace/home/beex-dgx/ML_VIT_TRAINING/vit_training/dinov3_BeeX/dinov3/
-  checkpoint_dir: checkpoints_fls_features_v2_epoch11_no_sigreg_lr1e4_2ep
+  checkpoint_dir: checkpoints_fls_features_v2_epoch11_no_sigreg_lr1e4_2ep_masked
   init_from: checkpoints_fls_features_v2/student_mobilevit_2M_Dinov3_based_epoch0011.pth
   resume_from: ""
 
@@ -28,6 +28,10 @@ sonar:
   sonar_wavelet: haar
   sonar_local_contrast_blur: 31
   sonar_edge_blur: 3
+  sonar_mask_mode: support_hull
+  sonar_mask_threshold: 3
+  sonar_mask_close_kernel: 21
+  sonar_mask_min_coverage: 0.05
 
 sigreg:
   lambda_sigreg: 0.0
