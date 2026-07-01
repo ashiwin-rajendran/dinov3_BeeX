@@ -16,3 +16,9 @@ dist/
 
 # Ignore vscode directory
 .vscode/
+
+# Ignore the weights in root directory
+weights/
+
+# Ignore the weights in dinov3 distillation training
+dinov3_distill_training/checkpoints*
